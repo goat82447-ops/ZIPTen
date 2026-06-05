@@ -1,0 +1,10 @@
+<Project>
+  <PropertyGroup>
+    <OutputPath>./bin</OutputPath>
+    <IntermediateOutputPath>./obj</IntermediateOutputPath>
+  </PropertyGroup>
+  
+  <ItemGroup>
+    <Project Include="AuthService/AuthService.csproj" />
+  </ItemGroup>
+</Project>

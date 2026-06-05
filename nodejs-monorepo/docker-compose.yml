@@ -1,0 +1,50 @@
+version: '3.8'
+
+services:
+  mongodb:
+    image: mongo:7.0
+    container_name: ekart-mongodb
+    ports:
+      - "27017:27017"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: root
+      MONGO_INITDB_ROOT_PASSWORD: password
+    volumes:
+      - mongodb_data:/data/db
+    networks:
+      - ekart-network
+
+  redis:
+    image: redis:7-alpine
+    container_name: ekart-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - ekart-network
+
+  backend:
+    build: .
+    container_name: ekart-backend
+    ports:
+      - "3000:3000"
+    environment:
+      MONGODB_URI: mongodb://root:password@mongodb:27017/lunchbox_db?authSource=admin
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      AUTH_ONLY_MODE: 0
+      OTP_DEBUG_MODE: 1
+    depends_on:
+      - mongodb
+      - redis
+    networks:
+      - ekart-network
+
+volumes:
+  mongodb_data:
+  redis_data:
+
+networks:
+  ekart-network:
+    driver: bridge
