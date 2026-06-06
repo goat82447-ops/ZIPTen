@@ -157,7 +157,7 @@ async function seedDatabase() {
       created_at: nowIso(),
       updated_at: nowIso()
     });
-    console.log('✓ Seeded default user: user / user123');
+    console.log('Seeded default user: user / user123');
   }
 }
 
@@ -190,7 +190,27 @@ async function getSession(token) {
 
 const app = express();
 
-app.use(cors());
+const allowedOrigins = [
+  'http://localhost:4200',
+  'https://enterprise-lunchbox-lms-prod.vercel.app'
+];
+
+const corsOptions = {
+  origin(origin, callback) {
+    // Allow non-browser clients (no Origin header) and known frontend origins.
+    if (!origin || allowedOrigins.includes(origin)) {
+      callback(null, true);
+      return;
+    }
+    callback(new Error('CORS origin not allowed'));
+  },
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-session-token'],
+  optionsSuccessStatus: 204
+};
+
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions));
 app.use(morgan('dev'));
 app.use(express.json());
 
@@ -264,7 +284,7 @@ app.post('/api/auth/login', async (req, res) => {
     });
 
     if (otpDebugMode) {
-      console.log(`🔐 OTP for ${username}: Email=${emailOtp}, Mobile=${mobileOtp}`);
+      console.log(`OTP for ${username}: Email=${emailOtp}, Mobile=${mobileOtp}`);
     }
 
     return res.json({
@@ -281,7 +301,15 @@ app.post('/api/auth/login', async (req, res) => {
 app.post('/api/auth/verify-otp', async (req, res) => {
   try {
     const { tempToken, emailOtp, mobileOtp } = req.body || {};
+    const session = await AuthSession.findOne({ token: tempToken });
     
+    if (!session) {
+      const authSession = await mongoose.connection.collection('authsessions').findOne({ token: tempToken });
+      if (!authSession) {
+        return res.status(401).json({ error: 'Invalid or expired temporary token.' });
+      }
+    }
+
     const emailCode = await OtpCode.findOne({
       session_token: tempToken,
       channel: 'email',
@@ -302,8 +330,7 @@ app.post('/api/auth/verify-otp', async (req, res) => {
 
     await OtpCode.updateMany({ session_token: tempToken }, { $set: { consumed: 1 } });
 
-    const authSession = await AuthSession.findOne({ token: tempToken });
-    const userId = authSession ? authSession.user_id : (await User.findOne({ username: 'user' }))._id;
+    const userId = session ? session.user_id : (await User.findOne({ username: 'user' }))._id;
     const sessionToken = await issueSessionToken(userId);
 
     return res.json({
@@ -377,36 +404,35 @@ app.use((err, _req, res, _next) => {
 
 async function start() {
   try {
-    console.log('📡 Connecting to MongoDB...');
+    console.log('Connecting to MongoDB...');
     await mongoose.connect(mongoUri);
-    console.log('✓ MongoDB connected successfully!');
+    console.log('MongoDB connected successfully!');
 
     await seedDatabase();
 
     app.listen(port, () => {
-      console.log(`\n✓ ekart-backend listening on :${port}`);
-      console.log(`📌 Mode: ${authOnlyMode ? 'auth-only' : 'full'}`);
-      console.log(`🌐 Health: http://localhost:${port}/health\n`);
+      console.log(`ekart-backend listening on :${port}`);
+      console.log(`mode: ${authOnlyMode ? 'auth-only' : 'full'}`);
     });
 
     // Start worker
     if (!authOnlyMode && orderQueue) {
       const worker = new Worker('order-fulfillment', async (job) => {
-        console.log(`⚙️  Processing job ${job.id}: ${JSON.stringify(job.data)}`);
+        console.log(`Processing job ${job.id}: ${JSON.stringify(job.data)}`);
         // Simulate order fulfillment
         await new Promise(resolve => setTimeout(resolve, 5000));
-        console.log(`✓ Job ${job.id} completed`);
+        console.log(`Job ${job.id} completed`);
         return { success: true };
       }, { connection: redisConnection });
 
       worker.on('failed', (job, err) => {
-        console.error(`❌ Job ${job.id} failed:`, err.message);
+        console.error(`Job ${job.id} failed:`, err.message);
       });
 
-      console.log('⚙️  Order fulfillment worker started\n');
+      console.log('Order fulfillment worker started');
     }
   } catch (error) {
-    console.error('❌ Failed to start backend', error);
+    console.error('Failed to start backend', error);
     process.exit(1);
   }
 }
