@@ -303,12 +303,13 @@ app.post('/api/auth/login', async (req, res) => {
       return res.status(400).json({ error: 'Username and password are required.' });
     }
 
-    const user = await User.findOne({ username });
+    const normalizedUsername = String(username).trim().toLowerCase();
+    const user = await User.findOne({ username: normalizedUsername });
     if (!user) {
       return res.status(401).json({ error: 'Invalid credentials.' });
     }
 
-    const passwordMatch = await bcrypt.compare(password, user.password);
+    const passwordMatch = await bcrypt.compare(String(password), String(user.password));
     if (!passwordMatch) {
       return res.status(401).json({ error: 'Invalid credentials.' });
     }
