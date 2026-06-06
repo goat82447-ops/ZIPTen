@@ -94,6 +94,7 @@ if (!authOnlyMode) {
 const userSchema = new mongoose.Schema({
   _id: String,
   username: String,
+  display_name: String,
   password: String,
   email: String,
   mobile: String,
@@ -298,7 +299,7 @@ app.post('/api/auth/register', async (req, res) => {
 // Auth Routes
 app.post('/api/auth/login', async (req, res) => {
   try {
-    const { username, password } = req.body || {};
+    const { username, password, role } = req.body || {};
     if (!username || !password) {
       return res.status(400).json({ error: 'Username and password are required.' });
     }
@@ -314,38 +315,27 @@ app.post('/api/auth/login', async (req, res) => {
       return res.status(401).json({ error: 'Invalid credentials.' });
     }
 
-    // Generate OTP
-    const tempToken = uuidv4();
-    const emailOtp = genOtp();
-    const mobileOtp = genOtp();
-    const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
-
-    await OtpCode.create({
-      _id: uuidv4(),
-      session_token: tempToken,
-      channel: 'email',
-      code: emailOtp,
-      consumed: 0,
-      created_at: nowIso(),
-      expires_at: expiresAt
-    });
-
-    await OtpCode.create({
-      _id: uuidv4(),
-      session_token: tempToken,
-      channel: 'mobile',
-      code: mobileOtp,
-      consumed: 0,
-      created_at: nowIso(),
-      expires_at: expiresAt
-    });
-
-    if (otpDebugMode) {
-      console.log(`OTP for ${username}: Email=${emailOtp}, Mobile=${mobileOtp}`);
+    const requestedRole = String(role || '').trim().toLowerCase();
+    if (requestedRole && requestedRole !== String(user.role || '').trim().toLowerCase()) {
+      return res.status(401).json({ error: 'Selected login mode does not match your account role.' });
     }
 
+    const sessionToken = await issueSessionToken(user._id);
+
     return res.json({
-      tempToken,
+      requiresOtp: false,
+      tempToken: '',
+      sessionToken,
+      user: {
+        id: user._id,
+        username: user.username,
+        displayName: user.display_name || user.username,
+        role: user.role,
+        email: user.email,
+        mobile: user.mobile,
+        captainVehicle: user.captain_vehicle || undefined,
+        profileImageUrl: user.profile_image || undefined
+      },
       message: 'Login successful.',
       channels: { email: user.email, mobile: user.mobile }
     });
