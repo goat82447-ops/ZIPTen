@@ -239,6 +239,62 @@ app.get('/health', (_req, res) => {
   });
 });
 
+app.post('/api/auth/register', async (req, res) => {
+  try {
+    const { username, displayName, email, mobile, password, role, captainVehicle, profileImageUrl } = req.body || {};
+
+    if (!username || !displayName || !email || !mobile || !password || !role) {
+      return res.status(400).json({ error: 'username, displayName, email, mobile, password, role are required.' });
+    }
+
+    const normalizedRole = String(role || '').trim().toLowerCase();
+    if (!['customer', 'admin', 'captain'].includes(normalizedRole)) {
+      return res.status(400).json({ error: 'role must be customer, admin, or captain.' });
+    }
+
+    if (normalizedRole === 'captain' && !captainVehicle) {
+      return res.status(400).json({ error: 'captainVehicle is required for captain registration.' });
+    }
+
+    const normalizedUsername = String(username).trim().toLowerCase();
+    const normalizedEmail = String(email).trim().toLowerCase();
+    const normalizedMobile = String(mobile).trim();
+
+    const existingUser = await User.findOne({
+      $or: [
+        { username: normalizedUsername },
+        { email: normalizedEmail },
+        { mobile: normalizedMobile }
+      ]
+    }).lean();
+
+    if (existingUser) {
+      return res.status(409).json({ error: 'User already exists.' });
+    }
+
+    const passwordHash = await bcrypt.hash(String(password), 10);
+    await User.create({
+      _id: uuidv4(),
+      username: normalizedUsername,
+      display_name: String(displayName).trim(),
+      email: normalizedEmail,
+      mobile: normalizedMobile,
+      password: passwordHash,
+      role: normalizedRole,
+      captain_vehicle: normalizedRole === 'captain' ? String(captainVehicle).trim() : null,
+      profile_image: profileImageUrl ? String(profileImageUrl).trim() : null,
+      customer_otp_completed: 1,
+      created_at: nowIso(),
+      updated_at: nowIso()
+    });
+
+    return res.status(201).json({ message: 'User registered successfully.' });
+  } catch (error) {
+    console.error('Register error', error);
+    return res.status(500).json({ error: 'Registration failed.' });
+  }
+});
+
 // Auth Routes
 app.post('/api/auth/login', async (req, res) => {
   try {
