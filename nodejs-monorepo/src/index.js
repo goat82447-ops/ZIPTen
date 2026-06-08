@@ -127,9 +127,37 @@ const authSessionSchema = new mongoose.Schema({
   expires_at: String
 });
 
+const supportComplaintSchema = new mongoose.Schema({
+  _id: String,
+  type: String,
+  subject: String,
+  name: String,
+  contact: String,
+  description: String,
+  user_id: String,
+  username: String,
+  created_at: String
+});
+
+const appFeedbackSchema = new mongoose.Schema({
+  _id: String,
+  feedback_type: String,
+  feedback_label: String,
+  app_version: String,
+  route: String,
+  rating: Number,
+  note: String,
+  user_id: String,
+  username: String,
+  submitted_at: String,
+  created_at: String
+});
+
 const User = mongoose.model('User', userSchema);
 const OtpCode = mongoose.model('OtpCode', otpCodeSchema);
 const AuthSession = mongoose.model('AuthSession', authSessionSchema);
+const SupportComplaint = mongoose.model('SupportComplaint', supportComplaintSchema);
+const AppFeedback = mongoose.model('AppFeedback', appFeedbackSchema);
 
 // ============================================================================
 // UTILITY FUNCTIONS
@@ -141,6 +169,33 @@ function nowIso() {
 
 function genOtp() {
   return `${Math.floor(100000 + Math.random() * 900000)}`;
+}
+
+const promoCatalog = [
+  { code: 'SAVE10', type: 'percent', value: 10, minAmount: 120, maxDiscount: 80 },
+  { code: 'FLAT50', type: 'flat', value: 50, minAmount: 250 },
+  { code: 'FIRST100', type: 'flat', value: 100, minAmount: 500 }
+];
+
+function evaluatePromoDiscount(promoRule, baseAmount) {
+  if (!promoRule || baseAmount <= 0) {
+    return 0;
+  }
+
+  if (baseAmount < promoRule.minAmount) {
+    return 0;
+  }
+
+  if (promoRule.type === 'flat') {
+    return Math.min(baseAmount, Number(promoRule.value || 0));
+  }
+
+  const percentDiscount = Math.round((baseAmount * Number(promoRule.value || 0)) / 100);
+  if (Number.isFinite(Number(promoRule.maxDiscount))) {
+    return Math.min(percentDiscount, Number(promoRule.maxDiscount));
+  }
+
+  return percentDiscount;
 }
 
 async function seedDatabase() {
@@ -226,8 +281,8 @@ app.get('/', (_req, res) => {
     version: '1.0.0',
     mode: authOnlyMode ? 'auth-only' : 'full',
     endpoints: authOnlyMode
-      ? ['/health', '/api/auth/login', '/api/auth/verify-otp']
-      : ['/health', '/api/auth/*', '/api/menu', '/api/orders', '/api/jobs']
+      ? ['/health', '/api/auth/login', '/api/auth/verify-otp', '/api/support/complaints', '/api/support/app-feedback', '/api/promos/validate']
+      : ['/health', '/api/auth/*', '/api/support/*', '/api/menu', '/api/orders', '/api/jobs']
   });
 });
 
@@ -387,6 +442,127 @@ app.post('/api/auth/verify-otp', async (req, res) => {
   } catch (error) {
     console.error('Verify OTP error', error);
     return res.status(500).json({ error: 'OTP verification failed.' });
+  }
+});
+
+app.post('/api/support/complaints', async (req, res) => {
+  try {
+    const { type, subject, name, contact, description } = req.body || {};
+
+    if (!type || !subject || !description) {
+      return res.status(400).json({ error: 'type, subject, and description are required.' });
+    }
+
+    const sessionToken = req.headers['x-session-token'];
+    const session = typeof sessionToken === 'string' ? await getSession(sessionToken) : null;
+
+    await SupportComplaint.create({
+      _id: uuidv4(),
+      type: String(type).trim(),
+      subject: String(subject).trim(),
+      name: String(name || '').trim(),
+      contact: String(contact || '').trim(),
+      description: String(description).trim(),
+      user_id: session?.user_id || '',
+      username: session?.username || '',
+      created_at: nowIso()
+    });
+
+    return res.status(201).json({ message: 'Complaint submitted successfully.' });
+  } catch (error) {
+    console.error('Support complaint submit error', error);
+    return res.status(500).json({ error: 'Failed to submit complaint.' });
+  }
+});
+
+app.post('/api/support/app-feedback', async (req, res) => {
+  try {
+    const {
+      feedbackType,
+      feedbackLabel,
+      appVersion,
+      route,
+      rating,
+      note,
+      submittedAt
+    } = req.body || {};
+
+    if (!feedbackType || !feedbackLabel || !appVersion || !route || !submittedAt) {
+      return res.status(400).json({
+        error: 'feedbackType, feedbackLabel, appVersion, route, and submittedAt are required.'
+      });
+    }
+
+    const sessionToken = req.headers['x-session-token'];
+    const session = typeof sessionToken === 'string' ? await getSession(sessionToken) : null;
+
+    await AppFeedback.create({
+      _id: uuidv4(),
+      feedback_type: String(feedbackType).trim(),
+      feedback_label: String(feedbackLabel).trim(),
+      app_version: String(appVersion).trim(),
+      route: String(route).trim(),
+      rating: Number.isFinite(Number(rating)) ? Number(rating) : 0,
+      note: String(note || '').trim(),
+      user_id: session?.user_id || '',
+      username: session?.username || '',
+      submitted_at: String(submittedAt).trim(),
+      created_at: nowIso()
+    });
+
+    return res.status(201).json({ message: 'App feedback submitted successfully.' });
+  } catch (error) {
+    console.error('App feedback submit error', error);
+    return res.status(500).json({ error: 'Failed to submit app feedback.' });
+  }
+});
+
+app.post('/api/promos/validate', async (req, res) => {
+  try {
+    const { code, amount } = req.body || {};
+    const normalizedCode = String(code || '').trim().toUpperCase();
+    const baseAmount = Number(amount || 0);
+
+    if (!normalizedCode) {
+      return res.status(400).json({ valid: false, error: 'Promo code is required.' });
+    }
+
+    if (!Number.isFinite(baseAmount) || baseAmount <= 0) {
+      return res.status(400).json({ valid: false, error: 'Valid amount is required.' });
+    }
+
+    const promoRule = promoCatalog.find((item) => item.code === normalizedCode);
+    if (!promoRule) {
+      return res.status(404).json({ valid: false, error: 'Invalid promo code.' });
+    }
+
+    if (baseAmount < promoRule.minAmount) {
+      return res.status(400).json({
+        valid: false,
+        error: `Promo requires minimum Rs ${promoRule.minAmount}.`,
+        minAmount: promoRule.minAmount
+      });
+    }
+
+    const discount = evaluatePromoDiscount(promoRule, baseAmount);
+    const payableAmount = Math.max(0, Math.round(baseAmount - discount));
+
+    return res.json({
+      valid: true,
+      code: promoRule.code,
+      discount,
+      payableAmount,
+      promo: {
+        code: promoRule.code,
+        type: promoRule.type,
+        value: promoRule.value,
+        minAmount: promoRule.minAmount,
+        maxDiscount: promoRule.maxDiscount
+      }
+    });
+  } catch (error) {
+    console.error('Promo validate error', error);
+    return res.status(500).json({ valid: false, error: 'Failed to validate promo code.' });
   }
 });
 
