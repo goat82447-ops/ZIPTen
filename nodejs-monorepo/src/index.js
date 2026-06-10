@@ -114,6 +114,7 @@ const userSchema = new mongoose.Schema({
 
 const otpCodeSchema = new mongoose.Schema({
   _id: String,
+  user_id: String,
   session_token: String,
   channel: String,
   code: String,
@@ -127,6 +128,7 @@ const authSessionSchema = new mongoose.Schema({
   user_id: String,
   username: String,
   role: String,
+  type: { type: String, default: 'session' },
   mfa_verified: Number,
   voice_verified: Number,
   created_at: String,
@@ -294,6 +296,50 @@ async function seedDatabase() {
   }
 }
 
+async function sendEmailOtp(email, otp) {
+  if (gmailTransporter && gmailFromEmail) {
+    await gmailTransporter.sendMail({
+      from: gmailFromEmail,
+      to: email,
+      subject: 'Your RouteX Registration OTP',
+      text: `Your OTP is ${otp}. It expires in 10 minutes.`,
+      html: `<p>Your RouteX registration OTP is <strong>${otp}</strong>. It expires in <strong>10 minutes</strong>.</p><p>Do not share this code with anyone.</p>`
+    });
+    return;
+  }
+  if (sendgridApiKey && sendgridFromEmail) {
+    await sgMail.send({
+      to: email,
+      from: sendgridFromEmail,
+      subject: 'Your RouteX Registration OTP',
+      text: `Your OTP is ${otp}. It expires in 10 minutes.`,
+      html: `<p>Your RouteX registration OTP is <strong>${otp}</strong>. It expires in <strong>10 minutes</strong>.</p><p>Do not share this code with anyone.</p>`
+    });
+    return;
+  }
+  if (!otpDebugMode) {
+    throw new Error('No email provider configured. Set GMAIL_USER/GMAIL_APP_PASSWORD or SENDGRID_API_KEY.');
+  }
+  console.log(`[DEV OTP EMAIL] ${email}: ${otp}`);
+}
+
+async function issueTempToken(userId) {
+  const token = `tmp_${uuidv4()}`;
+  const user = await User.findById(userId).lean();
+  await AuthSession.create({
+    token,
+    user_id: userId,
+    username: user ? user.username : '',
+    role: user ? user.role : '',
+    type: 'temp',
+    mfa_verified: 0,
+    voice_verified: 0,
+    created_at: nowIso(),
+    expires_at: new Date(Date.now() + 15 * 60 * 1000).toISOString()
+  });
+  return token;
+}
+
 async function issueSessionToken(userId) {
   const token = uuidv4();
   const user = await User.findById(userId);
@@ -325,7 +371,10 @@ const app = express();
 
 const allowedOrigins = [
   'http://localhost:4200',
-  'https://enterprise-lunchbox-lms-prod.vercel.app'
+  'https://enterprise-lunchbox-lms-prod.vercel.app',
+  'https://ekart-backend-buwi.onrender.com',
+  'capacitor://localhost',
+  'http://localhost'
 ];
 
 const corsOptions = {
@@ -359,7 +408,7 @@ app.get('/', (_req, res) => {
     version: '1.0.0',
     mode: authOnlyMode ? 'auth-only' : 'full',
     endpoints: authOnlyMode
-      ? ['/health', '/api/auth/login', '/api/auth/verify-otp', '/api/support/complaints', '/api/support/app-feedback', '/api/promos/validate']
+      ? ['/health', '/api/auth/login', '/api/auth/register', '/api/auth/verify-otp', '/api/support/complaints', '/api/support/app-feedback', '/api/promos/validate']
       : ['/health', '/api/auth/*', '/api/support/*', '/api/menu', '/api/orders', '/api/jobs']
   });
 });
@@ -407,8 +456,9 @@ app.post('/api/auth/register', async (req, res) => {
     }
 
     const passwordHash = await bcrypt.hash(String(password), 10);
+    const userId = uuidv4();
     await User.create({
-      _id: uuidv4(),
+      _id: userId,
       username: normalizedUsername,
       display_name: String(displayName).trim(),
       email: normalizedEmail,
@@ -417,12 +467,46 @@ app.post('/api/auth/register', async (req, res) => {
       role: normalizedRole,
       captain_vehicle: normalizedRole === 'captain' ? String(captainVehicle).trim() : null,
       profile_image: profileImageUrl ? String(profileImageUrl).trim() : null,
-      customer_otp_completed: 1,
+      customer_otp_completed: 0,
       created_at: nowIso(),
       updated_at: nowIso()
     });
 
-    return res.status(201).json({ message: 'User registered successfully.' });
+    const tempToken = await issueTempToken(userId);
+    const emailOtp = genOtp();
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+
+    await OtpCode.create({
+      _id: uuidv4(),
+      user_id: userId,
+      session_token: tempToken,
+      channel: 'email',
+      code: emailOtp,
+      consumed: 0,
+      created_at: nowIso(),
+      expires_at: expiresAt
+    });
+
+    try {
+      await sendEmailOtp(normalizedEmail, emailOtp);
+    } catch (emailErr) {
+      await OtpCode.deleteMany({ session_token: tempToken });
+      await AuthSession.deleteOne({ token: tempToken });
+      await User.deleteOne({ _id: userId });
+      console.error('Registration email OTP delivery error', emailErr);
+      return res.status(502).json({ error: 'Unable to send OTP email. Please check email provider settings and try again.' });
+    }
+
+    const payload = {
+      message: 'OTP sent to your email. Verify to complete registration.',
+      requiresOtp: true,
+      tempToken,
+      channels: { email: normalizedEmail }
+    };
+    if (otpDebugMode) {
+      payload.devOtps = { emailOtp };
+    }
+    return res.status(201).json(payload);
   } catch (error) {
     console.error('Register error', error);
     return res.status(500).json({ error: 'Registration failed.' });
@@ -453,6 +537,10 @@ app.post('/api/auth/login', async (req, res) => {
       return res.status(401).json({ error: 'Selected login mode does not match your account role.' });
     }
 
+    if (Number(user.customer_otp_completed) !== 1) {
+      return res.status(403).json({ error: 'Please verify your email OTP to activate your account before logging in.' });
+    }
+
     const sessionToken = await issueSessionToken(user._id);
 
     return res.json({
@@ -480,14 +568,15 @@ app.post('/api/auth/login', async (req, res) => {
 
 app.post('/api/auth/verify-otp', async (req, res) => {
   try {
-    const { tempToken, emailOtp, mobileOtp } = req.body || {};
-    const session = await AuthSession.findOne({ token: tempToken });
-    
+    const { tempToken, emailOtp } = req.body || {};
+
+    if (!tempToken || !emailOtp) {
+      return res.status(400).json({ error: 'tempToken and emailOtp are required.' });
+    }
+
+    const session = await AuthSession.findOne({ token: tempToken, type: 'temp', expires_at: { $gt: nowIso() } });
     if (!session) {
-      const authSession = await mongoose.connection.collection('authsessions').findOne({ token: tempToken });
-      if (!authSession) {
-        return res.status(401).json({ error: 'Invalid or expired temporary token.' });
-      }
+      return res.status(401).json({ error: 'Invalid or expired temporary token.' });
     }
 
     const emailCode = await OtpCode.findOne({
@@ -497,22 +586,15 @@ app.post('/api/auth/verify-otp', async (req, res) => {
       expires_at: { $gt: nowIso() }
     });
 
-    const mobileCode = await OtpCode.findOne({
-      session_token: tempToken,
-      channel: 'mobile',
-      consumed: 0,
-      expires_at: { $gt: nowIso() }
-    });
-
-    if (!emailCode || !mobileCode || emailCode.code !== String(emailOtp).trim() || mobileCode.code !== String(mobileOtp).trim()) {
-      return res.status(400).json({ error: 'Invalid OTP values.' });
+    if (!emailCode || emailCode.code !== String(emailOtp).trim()) {
+      return res.status(400).json({ error: 'Invalid or expired OTP.' });
     }
 
     await OtpCode.updateMany({ session_token: tempToken }, { $set: { consumed: 1 } });
+    await User.updateOne({ _id: session.user_id }, { $set: { customer_otp_completed: 1, updated_at: nowIso() } });
 
-    const userId = session ? session.user_id : (await User.findOne({ username: 'user' }))._id;
-    const sessionToken = await issueSessionToken(userId);
-    const verifiedUser = await User.findById(userId).lean();
+    const sessionToken = await issueSessionToken(session.user_id);
+    const verifiedUser = await User.findById(session.user_id).lean();
 
     return res.json({
       sessionToken,
@@ -526,7 +608,7 @@ app.post('/api/auth/verify-otp', async (req, res) => {
         captainVehicle: verifiedUser.captain_vehicle || undefined,
         profileImageUrl: verifiedUser.profile_image || undefined
       },
-      message: 'OTP verification successful.'
+      message: 'Email verified. Registration complete!'
     });
   } catch (error) {
     console.error('Verify OTP error', error);
@@ -855,6 +937,32 @@ app.post('/api/auth/logout', async (req, res) => {
   } catch (err) {
     console.error('Logout error', err);
     return res.status(500).json({ error: 'Logout failed.' });
+  }
+});
+
+// DELETE /api/auth/account — permanently delete the authenticated user's account
+app.delete('/api/auth/account', async (req, res) => {
+  try {
+    const token = req.headers['x-session-token'];
+    if (!token) return res.status(401).json({ error: 'Session token required.' });
+
+    const session = await getSession(token);
+    if (!session) return res.status(401).json({ error: 'Invalid or expired session.' });
+
+    const userId = session.user_id;
+
+    // Delete all user data
+    await Promise.all([
+      User.deleteOne({ _id: userId }),
+      AuthSession.deleteMany({ user_id: userId }),
+      OtpCode.deleteMany({ user_id: userId })
+    ]);
+
+    console.log(`[Account Deleted] userId=${userId} username=${session.username}`);
+    return res.json({ message: 'Account deleted successfully.' });
+  } catch (err) {
+    console.error('Delete account error', err);
+    return res.status(500).json({ error: 'Failed to delete account.' });
   }
 });
 
