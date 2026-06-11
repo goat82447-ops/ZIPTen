@@ -5,366 +5,236 @@ const express = require('express');
 const cors = require('cors');
 const morgan = require('morgan');
 const mongoose = require('mongoose');
-const { Queue, Worker } = require('bullmq');
-const IORedis = require('ioredis');
 const { v4: uuidv4 } = require('uuid');
 const bcrypt = require('bcryptjs');
 const sgMail = require('@sendgrid/mail');
 const nodemailer = require('nodemailer');
 const twilio = require('twilio');
 
-// ============================================================================
-// CONFIGURATION
-// ============================================================================
-
-// Load environment
 dotenv.config();
 
 const port = Number(process.env.PORT || 3000);
-const authOnlyMode = String(process.env.AUTH_ONLY_MODE || '0') === '1';
 const mongoUri = process.env.MONGODB_URI;
 const redisHost = process.env.REDIS_HOST || 'localhost';
 const redisPort = Number(process.env.REDIS_PORT || 6379);
 const otpDebugMode = process.env.OTP_DEBUG_MODE === '1';
-const githubRepo = String(process.env.GITHUB_REPO || '').trim();
-const githubToken = String(process.env.GITHUB_TOKEN || '').trim();
-const githubBugLabels = String(process.env.GITHUB_BUG_LABELS || 'bug,customer-report')
-  .split(',')
-  .map((label) => label.trim())
-  .filter(Boolean);
 
-// Validate required env vars
 if (!mongoUri) {
   console.error('ERROR: MONGODB_URI environment variable is not set');
   process.exit(1);
 }
 
-// ============================================================================
-// SERVICES SETUP
-// ============================================================================
-
-// Email Services
 const sendgridApiKey = process.env.SENDGRID_API_KEY || '';
 const sendgridFromEmail = process.env.SENDGRID_FROM_EMAIL || '';
 const gmailUser = process.env.GMAIL_USER || '';
 const gmailAppPassword = process.env.GMAIL_APP_PASSWORD || '';
 const gmailFromEmail = process.env.GMAIL_FROM_EMAIL || gmailUser;
-
-// SMS Service
 const twilioAccountSid = process.env.TWILIO_ACCOUNT_SID || '';
 const twilioAuthToken = process.env.TWILIO_AUTH_TOKEN || '';
 const twilioFromNumber = process.env.TWILIO_FROM_NUMBER || '';
 
-// APIs
-const googleMapsApiKey = process.env.GOOGLE_MAPS_API_KEY || '';
-const openWeatherApiKey = process.env.OPENWEATHER_API_KEY || '';
-
 let twilioClient = null;
 let gmailTransporter = null;
 
-if (sendgridApiKey) {
-  sgMail.setApiKey(sendgridApiKey);
-}
-
-if (twilioAccountSid && twilioAuthToken) {
-  twilioClient = twilio(twilioAccountSid, twilioAuthToken);
-}
-
+if (sendgridApiKey) sgMail.setApiKey(sendgridApiKey);
+if (twilioAccountSid && twilioAuthToken) twilioClient = twilio(twilioAccountSid, twilioAuthToken);
 if (gmailUser && gmailAppPassword) {
-  gmailTransporter = nodemailer.createTransport({
-    service: 'gmail',
-    auth: {
-      user: gmailUser,
-      pass: gmailAppPassword
-    }
-  });
-}
-
-// Redis for job queue
-let redisConnection = null;
-let orderQueue = null;
-
-if (!authOnlyMode) {
-  redisConnection = new IORedis({
-    host: redisHost,
-    port: redisPort,
-    maxRetriesPerRequest: null
-  });
-  orderQueue = new Queue('order-fulfillment', { connection: redisConnection });
+  gmailTransporter = nodemailer.createTransport({ service: 'gmail', auth: { user: gmailUser, pass: gmailAppPassword } });
 }
 
 // ============================================================================
-// DATABASE MODELS
+// DATABASE SCHEMAS
 // ============================================================================
 
 const userSchema = new mongoose.Schema({
-  _id: String,
-  username: String,
-  display_name: String,
-  password: String,
-  email: String,
-  mobile: String,
-  role: String,
-  customer_otp_completed: Number,
-  captain_vehicle: String,
-  profile_image: String,
-  created_at: String,
-  updated_at: String
+  _id: String, username: String, display_name: String, password: String,
+  email: String, mobile: String, role: String, customer_otp_completed: Number,
+  captain_vehicle: String, profile_image: String, created_at: String, updated_at: String
 });
 
 const otpCodeSchema = new mongoose.Schema({
-  _id: String,
-  user_id: String,
-  session_token: String,
-  channel: String,
-  code: String,
-  consumed: Number,
-  created_at: String,
-  expires_at: String
+  _id: String, user_id: String, session_token: String, channel: String,
+  code: String, consumed: Number, created_at: String, expires_at: String
 });
 
 const authSessionSchema = new mongoose.Schema({
-  token: String,
-  user_id: String,
-  username: String,
-  role: String,
-  type: { type: String, default: 'session' },
-  mfa_verified: Number,
-  voice_verified: Number,
-  created_at: String,
-  expires_at: String
+  _id: String, token: String, user_id: String, type: { type: String, default: 'session' },
+  mfa_verified: Number, voice_verified: Number, created_at: String, expires_at: String
 });
 
-const supportComplaintSchema = new mongoose.Schema({
+// ── BOOKING SCHEMA — full fields matching frontend Booking interface ──
+const bookingSchema = new mongoose.Schema({
   _id: String,
-  type: String,
-  subject: String,
-  name: String,
-  contact: String,
-  description: String,
-  user_id: String,
-  username: String,
-  created_at: String
+  user_id: String, user_name: String,
+  booking_for: String,
+  recipient_name: String, recipient_phone: String,
+  is_scheduled: Number, scheduled_at: String,
+  service_type: String, payment_method: String, vehicle_type: String,
+  pickup_json: String, drop_json: String, current_location_json: String,
+  status: String,                     // 'created' | 'assigned' | 'in_transit' | 'completed' | 'cancelled'
+  otp: String, otp_verified: Number,
+  driver_name: String, driver_phone: String,
+  captain_id: String,
+  notification_target: String,        // 'all' | 'preferred'  — CRITICAL for captain visibility
+  preferred_captain_id: String, preferred_captain_name: String,
+  notification: String,
+  estimated_fare: Number,
+  ride_notes: String,
+  sos_triggered: Number, sos_by_role: String,
+  feedback_submitted: Number, feedback_submitted_at: String,
+  feedback_text: String, ride_rating: Number, captain_rating: Number,
+  loved_ride: Number, loved_captain: Number,
+  final_amount: Number, payment_done: Number, payment_done_at: String,
+  tracking_closed: Number, tracking_closed_at: String,
+  created_at: String, updated_at: String
 });
 
-const appFeedbackSchema = new mongoose.Schema({
-  _id: String,
-  feedback_type: String,
-  feedback_label: String,
-  app_version: String,
-  route: String,
-  rating: Number,
-  note: String,
-  user_id: String,
-  username: String,
-  submitted_at: String,
-  created_at: String
+const captainFeedbackSchema = new mongoose.Schema({
+  _id: String, booking_id: String, captain_user_id: String, captain_name: String,
+  submitted_by_user_id: String, submitted_by_name: String,
+  ride_rating: Number, captain_rating: Number, feedback_text: String,
+  loved_ride: Number, loved_captain: Number, created_at: String, updated_at: String
 });
 
-const paymentDataSchema = new mongoose.Schema({
-  user_id: { type: String, unique: true, required: true },
-  wallet_balance: { type: Number, default: 0 },
-  pay_later_enabled: { type: Boolean, default: false },
-  pay_later_used: { type: Number, default: 0 },
-  linked_accounts: { type: Array, default: [] },
-  upi_ids: { type: Array, default: [] },
-  wallet_txns: { type: Array, default: [] },
-  pay_history: { type: Array, default: [] },
-  updated_at: { type: String, default: '' }
+const userActionSchema = new mongoose.Schema({
+  _id: String, user_id: String, action_type: String,
+  metadata_json: String, created_at: String
 });
 
 const User = mongoose.model('User', userSchema);
 const OtpCode = mongoose.model('OtpCode', otpCodeSchema);
 const AuthSession = mongoose.model('AuthSession', authSessionSchema);
-const SupportComplaint = mongoose.model('SupportComplaint', supportComplaintSchema);
-const AppFeedback = mongoose.model('AppFeedback', appFeedbackSchema);
-const PaymentData = mongoose.model('PaymentData', paymentDataSchema);
+const Booking = mongoose.model('Booking', bookingSchema);
+const CaptainFeedback = mongoose.model('CaptainFeedback', captainFeedbackSchema);
+const UserAction = mongoose.model('UserAction', userActionSchema);
 
 // ============================================================================
-// UTILITY FUNCTIONS
+// UTILITIES
 // ============================================================================
 
-function nowIso() {
-  return new Date().toISOString();
-}
+function nowIso() { return new Date().toISOString(); }
+function genOtp() { return `${Math.floor(100000 + Math.random() * 900000)}`; }
+function toBool(v) { return Number(v || 0) === 1; }
+function safeJson(text, fallback) { try { return JSON.parse(text); } catch { return fallback; } }
 
-function genOtp() {
-  return `${Math.floor(100000 + Math.random() * 900000)}`;
-}
-
-const promoCatalog = [
-  { code: 'SAVE10', type: 'percent', value: 10, minAmount: 120, maxDiscount: 80 },
-  { code: 'FLAT50', type: 'flat', value: 50, minAmount: 250 },
-  { code: 'FIRST100', type: 'flat', value: 100, minAmount: 500 }
-];
-
-function evaluatePromoDiscount(promoRule, baseAmount) {
-  if (!promoRule || baseAmount <= 0) {
-    return 0;
-  }
-
-  if (baseAmount < promoRule.minAmount) {
-    return 0;
-  }
-
-  if (promoRule.type === 'flat') {
-    return Math.min(baseAmount, Number(promoRule.value || 0));
-  }
-
-  const percentDiscount = Math.round((baseAmount * Number(promoRule.value || 0)) / 100);
-  if (Number.isFinite(Number(promoRule.maxDiscount))) {
-    return Math.min(percentDiscount, Number(promoRule.maxDiscount));
-  }
-
-  return percentDiscount;
-}
-
-function isBugReportType(typeValue) {
-  return String(typeValue || '').trim().toLowerCase() === 'bug';
-}
-
-async function createGitHubIssueForBugReport({ complaint, session }) {
-  if (!githubRepo || !githubToken) {
-    return {
-      attempted: false,
-      created: false,
-      reason: 'GitHub integration is not configured. Set GITHUB_REPO and GITHUB_TOKEN.'
-    };
-  }
-
-  const title = `[Bug Report] ${complaint.subject}`;
-  const bodyLines = [
-    '## New Bug Report',
-    '',
-    `- Complaint ID: ${complaint._id}`,
-    `- Type: ${complaint.type}`,
-    `- Name: ${complaint.name || 'N/A'}`,
-    `- Contact: ${complaint.contact || 'N/A'}`,
-    `- Username: ${session?.username || complaint.username || 'N/A'}`,
-    `- User ID: ${session?.user_id || complaint.user_id || 'N/A'}`,
-    `- Created At: ${complaint.created_at}`,
-    '',
-    '## Description',
-    complaint.description || 'No description provided.'
-  ];
-
-  const response = await fetch(`https://api.github.com/repos/${githubRepo}/issues`, {
-    method: 'POST',
-    headers: {
-      Accept: 'application/vnd.github+json',
-      Authorization: `Bearer ${githubToken}`,
-      'User-Agent': 'routex-support-bot',
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify({
-      title,
-      body: bodyLines.join('\n'),
-      labels: githubBugLabels
-    })
-  });
-
-  if (!response.ok) {
-    const errorPayload = await response.text();
-    throw new Error(`GitHub issue create failed (${response.status}): ${errorPayload}`);
-  }
-
-  const issue = await response.json();
+function mapBookingRow(row) {
   return {
-    attempted: true,
-    created: true,
-    issueUrl: issue.html_url,
-    issueNumber: issue.number
+    id: row._id,
+    userId: row.user_id,
+    userName: row.user_name,
+    bookingFor: row.booking_for,
+    recipientName: row.recipient_name || undefined,
+    recipientPhone: row.recipient_phone || undefined,
+    isScheduled: toBool(row.is_scheduled),
+    scheduledAt: row.scheduled_at || undefined,
+    serviceType: row.service_type,
+    paymentMethod: row.payment_method,
+    vehicleType: row.vehicle_type,
+    pickup: safeJson(row.pickup_json, { lat: 0, lng: 0, address: '' }),
+    drop: safeJson(row.drop_json, { lat: 0, lng: 0, address: '' }),
+    currentLocation: safeJson(row.current_location_json, { lat: 0, lng: 0, address: '' }),
+    status: row.status,
+    otp: row.otp,
+    otpVerified: toBool(row.otp_verified),
+    driverName: row.driver_name,
+    driverPhone: row.driver_phone,
+    captainId: row.captain_id || undefined,
+    notificationTarget: row.notification_target || 'all',   // ← DEFAULT 'all' so captains always see it
+    preferredCaptainId: row.preferred_captain_id || undefined,
+    preferredCaptainName: row.preferred_captain_name || undefined,
+    notification: row.notification,
+    estimatedFare: row.estimated_fare != null ? Number(row.estimated_fare) : undefined,
+    rideNotes: row.ride_notes || undefined,
+    sosTriggered: toBool(row.sos_triggered),
+    sosByRole: row.sos_by_role || undefined,
+    feedbackSubmitted: toBool(row.feedback_submitted),
+    feedbackSubmittedAt: row.feedback_submitted_at || undefined,
+    feedbackText: row.feedback_text || undefined,
+    rideRating: row.ride_rating != null ? Number(row.ride_rating) : undefined,
+    captainRating: row.captain_rating != null ? Number(row.captain_rating) : undefined,
+    lovedRide: toBool(row.loved_ride),
+    lovedCaptain: toBool(row.loved_captain),
+    finalAmount: row.final_amount != null ? Number(row.final_amount) : undefined,
+    paymentDone: toBool(row.payment_done),
+    paymentDoneAt: row.payment_done_at || undefined,
+    trackingClosed: toBool(row.tracking_closed),
+    trackingClosedAt: row.tracking_closed_at || undefined,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at
   };
 }
 
-async function seedDatabase() {
-  const existing = await User.findOne({ username: 'user' });
-  if (!existing) {
-    const hashedPassword = await bcrypt.hash('user123', 10);
-    await User.create({
-      _id: uuidv4(),
-      username: 'user',
-      password: hashedPassword,
-      email: 'user@ekart.local',
-      mobile: '9876543210',
-      role: 'customer',
-      customer_otp_completed: 1,
-      created_at: nowIso(),
-      updated_at: nowIso()
-    });
-    console.log('Seeded default user: user / user123');
-  }
+// ── Captain can see booking if notificationTarget='all' OR they are assigned ──
+function isCaptainAssignedToBooking(session, row) {
+  const target = String(row.notification_target || 'all').trim().toLowerCase();
+  if (target === 'all') return true;   // ← BROADCAST: every captain sees it
+  const cId   = String(session.user_id || '').toLowerCase();
+  const cUser = String(session.username || '').toLowerCase();
+  const cName = String(session.display_name || '').toLowerCase();
+  return (
+    (row.captain_id && String(row.captain_id).toLowerCase() === cId) ||
+    (row.preferred_captain_id && String(row.preferred_captain_id).toLowerCase() === cId) ||
+    (row.driver_name && String(row.driver_name).toLowerCase() === cUser) ||
+    (row.preferred_captain_name && String(row.preferred_captain_name).toLowerCase() === cName)
+  );
 }
 
-async function sendEmailOtp(email, otp) {
-  if (gmailTransporter && gmailFromEmail) {
-    await gmailTransporter.sendMail({
-      from: gmailFromEmail,
-      to: email,
-      subject: 'Your RouteX Registration OTP',
-      text: `Your OTP is ${otp}. It expires in 10 minutes.`,
-      html: `<p>Your RouteX registration OTP is <strong>${otp}</strong>. It expires in <strong>10 minutes</strong>.</p><p>Do not share this code with anyone.</p>`
-    });
-    return;
-  }
-  if (sendgridApiKey && sendgridFromEmail) {
-    await sgMail.send({
-      to: email,
-      from: sendgridFromEmail,
-      subject: 'Your RouteX Registration OTP',
-      text: `Your OTP is ${otp}. It expires in 10 minutes.`,
-      html: `<p>Your RouteX registration OTP is <strong>${otp}</strong>. It expires in <strong>10 minutes</strong>.</p><p>Do not share this code with anyone.</p>`
-    });
-    return;
-  }
-  if (!otpDebugMode) {
-    throw new Error('No email provider configured. Set GMAIL_USER/GMAIL_APP_PASSWORD or SENDGRID_API_KEY.');
-  }
-  console.log(`[DEV OTP EMAIL] ${email}: ${otp}`);
+function canAccessBooking(session, row) {
+  const role = String(session.role || '').toLowerCase();
+  if (role === 'admin') return true;
+  if (role === 'customer') return String(row.user_id || '') === String(session.user_id || '');
+  if (role === 'captain') return isCaptainAssignedToBooking(session, row);
+  return false;
 }
+
+// ============================================================================
+// SESSION HELPERS
+// ============================================================================
 
 async function issueTempToken(userId) {
   const token = `tmp_${uuidv4()}`;
-  const user = await User.findById(userId).lean();
-  await AuthSession.create({
-    token,
-    user_id: userId,
-    username: user ? user.username : '',
-    role: user ? user.role : '',
-    type: 'temp',
-    mfa_verified: 0,
-    voice_verified: 0,
-    created_at: nowIso(),
-    expires_at: new Date(Date.now() + 15 * 60 * 1000).toISOString()
-  });
+  await AuthSession.create({ _id: uuidv4(), user_id: userId, token, type: 'temp', mfa_verified: 0, voice_verified: 0, expires_at: new Date(Date.now() + 10 * 60 * 1000).toISOString(), created_at: nowIso() });
   return token;
 }
 
 async function issueSessionToken(userId) {
-  const token = uuidv4();
-  const user = await User.findById(userId);
-  const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
-  
-  await AuthSession.create({
-    token,
-    user_id: userId,
-    username: user.username,
-    role: user.role,
-    mfa_verified: 0,
-    voice_verified: 0,
-    created_at: nowIso(),
-    expires_at: expiresAt
-  });
-  
+  const token = `sess_${uuidv4()}`;
+  await AuthSession.create({ _id: uuidv4(), user_id: userId, token, type: 'session', mfa_verified: 1, voice_verified: 0, expires_at: new Date(Date.now() + 8 * 60 * 60 * 1000).toISOString(), created_at: nowIso() });
   return token;
 }
 
 async function getSession(token) {
-  return AuthSession.findOne({ token, expires_at: { $gt: nowIso() } });
+  if (!token) return null;
+  const session = await AuthSession.findOne({ token, expires_at: { $gt: nowIso() } }).lean();
+  if (!session) return null;
+  const user = await User.findById(session.user_id).lean();
+  if (!user) return null;
+  return { ...session, id: session._id, username: user.username, display_name: user.display_name, role: user.role, email: user.email, mobile: user.mobile, captain_vehicle: user.captain_vehicle, profile_image: user.profile_image };
+}
+
+async function requireSession(req, res, next) {
+  const token = req.headers['x-session-token'] || req.query.sessionToken;
+  const session = await getSession(token);
+  if (!session || session.type !== 'session') return res.status(401).json({ error: 'Valid session token required.' });
+  req.session = session;
+  return next();
+}
+
+async function sendEmailOtp(email, otp) {
+  if (gmailTransporter && gmailFromEmail) {
+    await gmailTransporter.sendMail({ from: gmailFromEmail, to: email, subject: 'Your RouteX OTP', text: `Your OTP is ${otp}. Valid for 10 minutes.`, html: `<p>Your OTP is <strong>${otp}</strong>. Valid for 10 minutes.</p>` });
+    return;
+  }
+  if (sendgridApiKey && sendgridFromEmail) {
+    await sgMail.send({ to: email, from: sendgridFromEmail, subject: 'Your RouteX OTP', text: `Your OTP is ${otp}. Valid for 10 minutes.` });
+    return;
+  }
+  if (!otpDebugMode) throw new Error('No email provider configured.');
+  console.log(`[DEV OTP] ${email}: ${otp}`);
 }
 
 // ============================================================================
-// EXPRESS APP SETUP
+// EXPRESS APP
 // ============================================================================
 
 const app = express();
@@ -377,22 +247,13 @@ const allowedOrigins = [
   'http://localhost'
 ];
 
-const corsOptions = {
-  origin(origin, callback) {
-    // Allow non-browser clients (no Origin header) and known frontend origins.
-    if (!origin || allowedOrigins.includes(origin)) {
-      callback(null, true);
-      return;
-    }
-    callback(new Error('CORS origin not allowed'));
-  },
-  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'x-session-token'],
+app.use(cors({
+  origin(origin, cb) { if (!origin || allowedOrigins.includes(origin)) cb(null, true); else cb(new Error('CORS not allowed')); },
+  methods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
+  allowedHeaders: ['Content-Type','Authorization','x-session-token'],
   optionsSuccessStatus: 204
-};
-
-app.use(cors(corsOptions));
-app.options('*', cors(corsOptions));
+}));
+app.options('*', cors());
 app.use(morgan('dev'));
 app.use(express.json({ limit: '25mb' }));
 app.use(express.urlencoded({ extended: true, limit: '25mb' }));
@@ -401,1077 +262,367 @@ app.use(express.urlencoded({ extended: true, limit: '25mb' }));
 // ROUTES
 // ============================================================================
 
-app.get('/', (_req, res) => {
-  res.json({
-    service: 'ekart-backend',
-    status: 'ok',
-    version: '1.0.0',
-    mode: authOnlyMode ? 'auth-only' : 'full',
-    endpoints: authOnlyMode
-      ? ['/health', '/api/auth/login', '/api/auth/register', '/api/auth/verify-otp', '/api/support/complaints', '/api/support/app-feedback', '/api/promos/validate']
-      : ['/health', '/api/auth/*', '/api/support/*', '/api/menu', '/api/orders', '/api/jobs']
-  });
-});
+app.get('/', (_req, res) => res.json({ service: 'routex-backend', status: 'ok', version: '1.0.0' }));
 
 app.get('/health', (_req, res) => {
-  res.json({
-    service: 'ekart-backend',
-    status: 'ok',
-    mode: authOnlyMode ? 'auth-only' : 'full',
-    timestamp: new Date().toISOString()
-  });
+  const mongoOk = mongoose.connection.readyState === 1;
+  res.json({ service: 'routex-backend', status: mongoOk ? 'ok' : 'degraded', database: mongoOk ? 'connected' : 'disconnected', timestamp: nowIso() });
 });
+
+// ── AUTH ──────────────────────────────────────────────────────────────────────
 
 app.post('/api/auth/register', async (req, res) => {
   try {
     const { username, displayName, email, mobile, password, role, captainVehicle, profileImageUrl } = req.body || {};
-
-    if (!username || !displayName || !email || !mobile || !password || !role) {
-      return res.status(400).json({ error: 'username, displayName, email, mobile, password, role are required.' });
-    }
-
-    const normalizedRole = String(role || '').trim().toLowerCase();
-    if (!['customer', 'admin', 'captain'].includes(normalizedRole)) {
-      return res.status(400).json({ error: 'role must be customer, admin, or captain.' });
-    }
-
-    if (normalizedRole === 'captain' && !captainVehicle) {
-      return res.status(400).json({ error: 'captainVehicle is required for captain registration.' });
-    }
-
-    const normalizedUsername = String(username).trim().toLowerCase();
-    const normalizedEmail = String(email).trim().toLowerCase();
-    const normalizedMobile = String(mobile).trim();
-
-    const existingUser = await User.findOne({
-      $or: [
-        { username: normalizedUsername },
-        { email: normalizedEmail },
-        { mobile: normalizedMobile }
-      ]
-    }).lean();
-
-    if (existingUser) {
-      return res.status(409).json({ error: 'User already exists.' });
-    }
-
-    const passwordHash = await bcrypt.hash(String(password), 10);
+    if (!username || !displayName || !email || !mobile || !password || !role) return res.status(400).json({ error: 'All fields are required.' });
+    const normalizedRole = String(role).trim().toLowerCase();
+    if (!['customer','admin','captain'].includes(normalizedRole)) return res.status(400).json({ error: 'Invalid role.' });
+    if (normalizedRole === 'captain' && !captainVehicle) return res.status(400).json({ error: 'captainVehicle is required for captains.' });
+    const exists = await User.findOne({ $or: [{ username: username.trim().toLowerCase() }, { email: email.trim().toLowerCase() }] });
+    if (exists) return res.status(409).json({ error: 'User already exists.' });
     const userId = uuidv4();
     await User.create({
-      _id: userId,
-      username: normalizedUsername,
-      display_name: String(displayName).trim(),
-      email: normalizedEmail,
-      mobile: normalizedMobile,
-      password: passwordHash,
-      role: normalizedRole,
+      _id: userId, username: username.trim().toLowerCase(), display_name: displayName.trim(),
+      email: email.trim().toLowerCase(), mobile: mobile.trim(),
+      password: bcrypt.hashSync(password, 10), role: normalizedRole,
       captain_vehicle: normalizedRole === 'captain' ? String(captainVehicle).trim() : null,
-      profile_image: profileImageUrl ? String(profileImageUrl).trim() : null,
-      customer_otp_completed: 0,
-      created_at: nowIso(),
-      updated_at: nowIso()
+      profile_image: profileImageUrl || null,
+      customer_otp_completed: normalizedRole === 'customer' ? 0 : 1,
+      created_at: nowIso(), updated_at: nowIso()
     });
-
+    if (normalizedRole !== 'customer') return res.status(201).json({ message: 'Registered successfully.' });
     const tempToken = await issueTempToken(userId);
     const emailOtp = genOtp();
-    const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
-
-    await OtpCode.create({
-      _id: uuidv4(),
-      user_id: userId,
-      session_token: tempToken,
-      channel: 'email',
-      code: emailOtp,
-      consumed: 0,
-      created_at: nowIso(),
-      expires_at: expiresAt
-    });
-
-    try {
-      await sendEmailOtp(normalizedEmail, emailOtp);
-    } catch (emailErr) {
-      await OtpCode.deleteMany({ session_token: tempToken });
-      await AuthSession.deleteOne({ token: tempToken });
+    await OtpCode.create({ _id: uuidv4(), user_id: userId, session_token: tempToken, channel: 'email', code: emailOtp, consumed: 0, expires_at: new Date(Date.now() + 10 * 60 * 1000).toISOString(), created_at: nowIso() });
+    try { await sendEmailOtp(email.trim().toLowerCase(), emailOtp); } catch (e) {
       await User.deleteOne({ _id: userId });
-      console.error('Registration email OTP delivery error', emailErr);
-      return res.status(502).json({ error: 'Unable to send OTP email. Please check email provider settings and try again.' });
+      return res.status(502).json({ error: 'Could not send OTP email.' });
     }
-
-    const payload = {
-      message: 'OTP sent to your email. Verify to complete registration.',
-      requiresOtp: true,
-      tempToken,
-      channels: { email: normalizedEmail }
-    };
-    if (otpDebugMode) {
-      payload.devOtps = { emailOtp };
-    }
+    const payload = { message: 'OTP sent to email. Verify to complete registration.', requiresOtp: true, tempToken, channels: { email: email.trim().toLowerCase() } };
+    if (otpDebugMode) payload.devOtps = { emailOtp };
     return res.status(201).json(payload);
-  } catch (error) {
-    console.error('Register error', error);
-    return res.status(500).json({ error: 'Registration failed.' });
-  }
+  } catch (err) { console.error('Register error', err); return res.status(500).json({ error: 'Registration failed.' }); }
 });
 
-// Auth Routes
 app.post('/api/auth/login', async (req, res) => {
   try {
     const { username, password, role } = req.body || {};
-    if (!username || !password) {
-      return res.status(400).json({ error: 'Username and password are required.' });
-    }
-
-    const normalizedUsername = String(username).trim().toLowerCase();
-    const user = await User.findOne({ username: normalizedUsername });
-    if (!user) {
-      return res.status(401).json({ error: 'Invalid credentials.' });
-    }
-
-    const passwordMatch = await bcrypt.compare(String(password), String(user.password));
-    if (!passwordMatch) {
-      return res.status(401).json({ error: 'Invalid credentials.' });
-    }
-
+    const user = await User.findOne({ username: (username || '').trim().toLowerCase() }).lean();
+    if (!user || !bcrypt.compareSync(String(password || ''), String(user.password || ''))) return res.status(401).json({ error: 'Invalid username or password.' });
     const requestedRole = String(role || '').trim().toLowerCase();
-    if (requestedRole && requestedRole !== String(user.role || '').trim().toLowerCase()) {
-      return res.status(401).json({ error: 'Selected login mode does not match your account role.' });
-    }
-
-    if (Number(user.customer_otp_completed) !== 1) {
-      return res.status(403).json({ error: 'Please verify your email OTP to activate your account before logging in.' });
-    }
-
+    if (requestedRole && requestedRole !== String(user.role || '').toLowerCase()) return res.status(401).json({ error: 'Selected login mode does not match your account role.' });
+    if (user.role === 'customer' && Number(user.customer_otp_completed) !== 1) return res.status(403).json({ error: 'Complete OTP verification first.' });
     const sessionToken = await issueSessionToken(user._id);
-
     return res.json({
-      requiresOtp: false,
-      tempToken: '',
-      sessionToken,
-      user: {
-        id: user._id,
-        username: user.username,
-        displayName: user.display_name || user.username,
-        role: user.role,
-        email: user.email,
-        mobile: user.mobile,
-        captainVehicle: user.captain_vehicle || undefined,
-        profileImageUrl: user.profile_image || undefined
-      },
-      message: 'Login successful.',
-      channels: { email: user.email, mobile: user.mobile }
+      requiresOtp: false, tempToken: '', sessionToken,
+      user: { id: user._id, username: user.username, displayName: user.display_name, role: user.role, email: user.email, mobile: user.mobile, captainVehicle: user.captain_vehicle || undefined, profileImageUrl: user.profile_image || undefined },
+      message: 'Login successful.', channels: { email: user.email, mobile: user.mobile }
     });
-  } catch (error) {
-    console.error('Login error', error);
-    return res.status(500).json({ error: 'Login failed.' });
-  }
+  } catch (err) { console.error('Login error', err); return res.status(500).json({ error: 'Login failed.' }); }
 });
 
 app.post('/api/auth/verify-otp', async (req, res) => {
   try {
     const { tempToken, emailOtp } = req.body || {};
-
-    if (!tempToken || !emailOtp) {
-      return res.status(400).json({ error: 'tempToken and emailOtp are required.' });
-    }
-
-    const session = await AuthSession.findOne({ token: tempToken, type: 'temp', expires_at: { $gt: nowIso() } });
-    if (!session) {
-      return res.status(401).json({ error: 'Invalid or expired temporary token.' });
-    }
-
-    const emailCode = await OtpCode.findOne({
-      session_token: tempToken,
-      channel: 'email',
-      consumed: 0,
-      expires_at: { $gt: nowIso() }
-    });
-
-    if (!emailCode || emailCode.code !== String(emailOtp).trim()) {
-      return res.status(400).json({ error: 'Invalid or expired OTP.' });
-    }
-
+    const session = await getSession(tempToken);
+    if (!session || session.type !== 'temp') return res.status(401).json({ error: 'Invalid or expired temp token.' });
+    const code = await OtpCode.findOne({ session_token: tempToken, channel: 'email', consumed: 0, expires_at: { $gt: nowIso() } }).lean();
+    if (!code || code.code !== String(emailOtp || '').trim()) return res.status(400).json({ error: 'Invalid or expired OTP.' });
     await OtpCode.updateMany({ session_token: tempToken }, { $set: { consumed: 1 } });
-    await User.updateOne({ _id: session.user_id }, { $set: { customer_otp_completed: 1, updated_at: nowIso() } });
-
+    await User.updateOne({ _id: session.user_id }, { $set: { customer_otp_completed: 1 } });
     const sessionToken = await issueSessionToken(session.user_id);
-    const verifiedUser = await User.findById(session.user_id).lean();
-
-    return res.json({
-      sessionToken,
-      user: {
-        id: verifiedUser._id,
-        username: verifiedUser.username,
-        displayName: verifiedUser.display_name || verifiedUser.username,
-        role: verifiedUser.role,
-        email: verifiedUser.email,
-        mobile: verifiedUser.mobile,
-        captainVehicle: verifiedUser.captain_vehicle || undefined,
-        profileImageUrl: verifiedUser.profile_image || undefined
-      },
-      message: 'Email verified. Registration complete!'
-    });
-  } catch (error) {
-    console.error('Verify OTP error', error);
-    return res.status(500).json({ error: 'OTP verification failed.' });
-  }
-});
-
-app.post('/api/auth/profile-image', async (req, res) => {
-  try {
-    const token = req.headers['x-session-token'];
-    if (!token) return res.status(401).json({ error: 'Valid session token required.' });
-    const session = await getSession(token);
-    if (!session) return res.status(401).json({ error: 'Valid session token required.' });
-
-    const { profileImageUrl } = req.body || {};
-    if (!profileImageUrl) return res.status(400).json({ error: 'profileImageUrl is required.' });
-
-    await User.updateOne({ _id: session.user_id }, { $set: { profile_image: String(profileImageUrl).trim() } });
-    return res.json({ message: 'Profile image updated successfully.', profileImageUrl: String(profileImageUrl).trim() });
-  } catch (error) {
-    console.error('Profile image update error', error);
-    return res.status(500).json({ error: 'Failed to update profile image.' });
-  }
-});
-
-// ── PAYMENT DATA ──────────────────────────────────────────────────────────────
-
-async function requirePaymentSession(req, res) {
-  const token = req.headers['x-session-token'];
-  if (!token) { res.status(401).json({ error: 'Session token required.' }); return null; }
-  const session = await getSession(token);
-  if (!session) { res.status(401).json({ error: 'Session token required.' }); return null; }
-  return session;
-}
-
-// GET /api/payment — fetch or create payment profile for current user
-app.get('/api/payment', async (req, res) => {
-  try {
-    const session = await requirePaymentSession(req, res);
-    if (!session) return;
-    let doc = await PaymentData.findOne({ user_id: session.user_id });
-    if (!doc) {
-      doc = await PaymentData.create({ user_id: session.user_id, updated_at: nowIso() });
-    }
-    return res.json(doc);
-  } catch (err) {
-    console.error('GET /api/payment error', err);
-    return res.status(500).json({ error: 'Failed to load payment data.' });
-  }
-});
-
-// PATCH /api/payment — update full payment profile (wallet, accounts, upi, etc.)
-app.patch('/api/payment', async (req, res) => {
-  try {
-    const session = await requirePaymentSession(req, res);
-    if (!session) return;
-    const allowed = ['wallet_balance','pay_later_enabled','pay_later_used','linked_accounts','upi_ids','wallet_txns','pay_history'];
-    const update = {};
-    for (const key of allowed) {
-      if (Object.prototype.hasOwnProperty.call(req.body, key)) {
-        update[key] = req.body[key];
-      }
-    }
-    update.updated_at = nowIso();
-    const doc = await PaymentData.findOneAndUpdate(
-      { user_id: session.user_id },
-      { $set: update },
-      { upsert: true, new: true }
-    );
-    return res.json(doc);
-  } catch (err) {
-    console.error('PATCH /api/payment error', err);
-    return res.status(500).json({ error: 'Failed to save payment data.' });
-  }
-});
-
-// POST /api/payment/wallet/add — add money to wallet
-app.post('/api/payment/wallet/add', async (req, res) => {
-  try {
-    const session = await requirePaymentSession(req, res);
-    if (!session) return;
-    const amount = Number(req.body.amount);
-    if (!amount || amount < 1) return res.status(400).json({ error: 'amount must be >= 1' });
-    const txn = {
-      label: `Added ₹${amount} to wallet`,
-      date: new Date().toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' }),
-      amount,
-      type: 'credit'
-    };
-    const hist = { label: 'Wallet Top-up', date: new Date().toLocaleDateString('en-IN', { day: '2-digit', month: 'short' }), amount, mode: 'wallet', refund: true };
-    const doc = await PaymentData.findOneAndUpdate(
-      { user_id: session.user_id },
-      { $inc: { wallet_balance: amount }, $push: { wallet_txns: { $each: [txn], $position: 0 }, pay_history: { $each: [hist], $position: 0 } }, $set: { updated_at: nowIso() } },
-      { upsert: true, new: true }
-    );
-    return res.json({ message: 'Wallet topped up.', wallet_balance: doc.wallet_balance, txn });
-  } catch (err) {
-    console.error('POST /api/payment/wallet/add error', err);
-    return res.status(500).json({ error: 'Failed to add money.' });
-  }
-});
-
-app.post('/api/support/complaints', async (req, res) => {
-  try {
-    const { type, subject, name, contact, description } = req.body || {};
-
-    if (!type || !subject || !description) {
-      return res.status(400).json({ error: 'type, subject, and description are required.' });
-    }
-
-    const sessionToken = req.headers['x-session-token'];
-    const session = typeof sessionToken === 'string' ? await getSession(sessionToken) : null;
-
-    const complaint = await SupportComplaint.create({
-      _id: uuidv4(),
-      type: String(type).trim(),
-      subject: String(subject).trim(),
-      name: String(name || '').trim(),
-      contact: String(contact || '').trim(),
-      description: String(description).trim(),
-      user_id: session?.user_id || '',
-      username: session?.username || '',
-      created_at: nowIso()
-    });
-
-    if (!isBugReportType(type)) {
-      return res.status(201).json({ message: 'Complaint submitted successfully.' });
-    }
-
-    try {
-      const issueResult = await createGitHubIssueForBugReport({ complaint, session });
-      if (issueResult.created) {
-        return res.status(201).json({
-          message: `Bug submitted and GitHub issue #${issueResult.issueNumber} created successfully.`,
-          issueUrl: issueResult.issueUrl,
-          issueNumber: issueResult.issueNumber
-        });
-      }
-
-      return res.status(201).json({
-        message: `Bug submitted successfully. ${issueResult.reason}`
-      });
-    } catch (integrationError) {
-      console.error('GitHub bug issue create error', integrationError);
-      return res.status(201).json({
-        message: 'Bug submitted successfully, but GitHub issue creation failed. Please check server logs.'
-      });
-    }
-  } catch (error) {
-    console.error('Support complaint submit error', error);
-    return res.status(500).json({ error: 'Failed to submit complaint.' });
-  }
-});
-
-app.post('/api/support/app-feedback', async (req, res) => {
-  try {
-    const {
-      feedbackType,
-      feedbackLabel,
-      appVersion,
-      route,
-      rating,
-      note,
-      submittedAt
-    } = req.body || {};
-
-    if (!feedbackType || !feedbackLabel || !appVersion || !route || !submittedAt) {
-      return res.status(400).json({
-        error: 'feedbackType, feedbackLabel, appVersion, route, and submittedAt are required.'
-      });
-    }
-
-    const sessionToken = req.headers['x-session-token'];
-    const session = typeof sessionToken === 'string' ? await getSession(sessionToken) : null;
-
-    await AppFeedback.create({
-      _id: uuidv4(),
-      feedback_type: String(feedbackType).trim(),
-      feedback_label: String(feedbackLabel).trim(),
-      app_version: String(appVersion).trim(),
-      route: String(route).trim(),
-      rating: Number.isFinite(Number(rating)) ? Number(rating) : 0,
-      note: String(note || '').trim(),
-      user_id: session?.user_id || '',
-      username: session?.username || '',
-      submitted_at: String(submittedAt).trim(),
-      created_at: nowIso()
-    });
-
-    return res.status(201).json({ message: 'App feedback submitted successfully.' });
-  } catch (error) {
-    console.error('App feedback submit error', error);
-    return res.status(500).json({ error: 'Failed to submit app feedback.' });
-  }
-});
-
-app.post('/api/promos/validate', async (req, res) => {
-  try {
-    const { code, amount } = req.body || {};
-    const normalizedCode = String(code || '').trim().toUpperCase();
-    const baseAmount = Number(amount || 0);
-
-    if (!normalizedCode) {
-      return res.status(400).json({ valid: false, error: 'Promo code is required.' });
-    }
-
-    if (!Number.isFinite(baseAmount) || baseAmount <= 0) {
-      return res.status(400).json({ valid: false, error: 'Valid amount is required.' });
-    }
-
-    const promoRule = promoCatalog.find((item) => item.code === normalizedCode);
-    if (!promoRule) {
-      return res.status(404).json({ valid: false, error: 'Invalid promo code.' });
-    }
-
-    if (baseAmount < promoRule.minAmount) {
-      return res.status(400).json({
-        valid: false,
-        error: `Promo requires minimum Rs ${promoRule.minAmount}.`,
-        minAmount: promoRule.minAmount
-      });
-    }
-
-    const discount = evaluatePromoDiscount(promoRule, baseAmount);
-    const payableAmount = Math.max(0, Math.round(baseAmount - discount));
-
-    return res.json({
-      valid: true,
-      code: promoRule.code,
-      discount,
-      payableAmount,
-      promo: {
-        code: promoRule.code,
-        type: promoRule.type,
-        value: promoRule.value,
-        minAmount: promoRule.minAmount,
-        maxDiscount: promoRule.maxDiscount
-      }
-    });
-  } catch (error) {
-    console.error('Promo validate error', error);
-    return res.status(500).json({ valid: false, error: 'Failed to validate promo code.' });
-  }
-});
-
-// Menu Routes
-if (!authOnlyMode) {
-  const menuItems = [
-    { id: '1', name: 'Pepperoni Pizza', price: 12.99, description: 'Classic pizza' },
-    { id: '2', name: 'Veggie Burger', price: 8.99, description: 'Fresh vegetables' },
-    { id: '3', name: 'Pasta Alfredo', price: 10.99, description: 'Creamy pasta' }
-  ];
-
-  app.get('/api/menu', (_req, res) => {
-    res.json(menuItems);
-  });
-
-  // Order Routes
-  app.post('/api/orders', async (req, res) => {
-    try {
-      const { userId, items, deliveryAddress } = req.body || {};
-      if (!userId || !Array.isArray(items) || items.length === 0 || !deliveryAddress) {
-        return res.status(400).json({ error: 'Required fields missing.' });
-      }
-
-      const orderId = uuidv4();
-      const total = items.reduce((sum, item) => sum + item.price * item.quantity, 0);
-
-      // Queue job
-      const job = await orderQueue.add('fulfill-order', { orderId }, {
-        attempts: 3,
-        backoff: { type: 'exponential', delay: 1000 }
-      });
-
-      return res.status(201).json({
-        id: orderId,
-        userId,
-        items,
-        totalPrice: total,
-        status: 'received',
-        jobId: job.id,
-        createdAt: nowIso()
-      });
-    } catch (error) {
-      console.error('Create order error', error);
-      return res.status(500).json({ error: 'Failed to create order.' });
-    }
-  });
-
-  app.get('/api/orders/:orderId', async (req, res) => {
-    res.json({ id: req.params.orderId, status: 'received', totalPrice: 0 });
-  });
-}
-
-// ============================================================================
-// MISSING ROUTES — Auth, Bookings, Places, Pricing, Integrations
-// ============================================================================
-
-// GET /api/auth/me
-app.get('/api/auth/me', async (req, res) => {
-  try {
-    const token = req.headers['x-session-token'];
-    if (!token) return res.status(401).json({ error: 'Valid session token required.' });
-    const session = await getSession(token);
-    if (!session) return res.status(401).json({ error: 'Valid session token required.' });
     const user = await User.findById(session.user_id).lean();
-    if (!user) return res.status(404).json({ error: 'User not found.' });
-    return res.json({
-      id: user._id, username: user.username, displayName: user.display_name || user.username,
-      role: user.role, email: user.email, mobile: user.mobile,
-      captainVehicle: user.captain_vehicle || undefined,
-      profileImageUrl: user.profile_image || undefined
-    });
-  } catch (err) {
-    console.error('GET /api/auth/me error', err);
-    return res.status(500).json({ error: 'Failed to get user.' });
-  }
+    return res.json({ sessionToken, user: { id: user._id, username: user.username, displayName: user.display_name, role: user.role, email: user.email, mobile: user.mobile, captainVehicle: user.captain_vehicle || undefined }, message: 'Verified successfully!' });
+  } catch (err) { console.error('Verify OTP error', err); return res.status(500).json({ error: 'OTP verification failed.' }); }
 });
 
-// POST /api/auth/logout
-app.post('/api/auth/logout', async (req, res) => {
-  try {
-    const token = req.headers['x-session-token'];
-    if (token) await AuthSession.deleteOne({ token });
-    return res.json({ message: 'Logged out successfully.' });
-  } catch (err) {
-    console.error('Logout error', err);
-    return res.status(500).json({ error: 'Logout failed.' });
-  }
+app.post('/api/auth/logout', requireSession, async (req, res) => {
+  await AuthSession.deleteOne({ token: req.session.token });
+  return res.json({ message: 'Logged out successfully.' });
 });
 
-// DELETE /api/auth/account — permanently delete the authenticated user's account
-app.delete('/api/auth/account', async (req, res) => {
-  try {
-    const token = req.headers['x-session-token'];
-    if (!token) return res.status(401).json({ error: 'Session token required.' });
-
-    const session = await getSession(token);
-    if (!session) return res.status(401).json({ error: 'Invalid or expired session.' });
-
-    const userId = session.user_id;
-
-    // Delete all user data
-    await Promise.all([
-      User.deleteOne({ _id: userId }),
-      AuthSession.deleteMany({ user_id: userId }),
-      OtpCode.deleteMany({ user_id: userId })
-    ]);
-
-    console.log(`[Account Deleted] userId=${userId} username=${session.username}`);
-    return res.json({ message: 'Account deleted successfully.' });
-  } catch (err) {
-    console.error('Delete account error', err);
-    return res.status(500).json({ error: 'Failed to delete account.' });
-  }
+app.get('/api/auth/me', requireSession, (req, res) => {
+  return res.json({ id: req.session.user_id, username: req.session.username, displayName: req.session.display_name, role: req.session.role, email: req.session.email, mobile: req.session.mobile, captainVehicle: req.session.captain_vehicle || undefined, profileImageUrl: req.session.profile_image || undefined });
 });
 
-// POST /api/auth/user-action
-app.post('/api/auth/user-action', async (req, res) => {
-  try {
-    const token = req.headers['x-session-token'];
-    const session = token ? await getSession(token) : null;
-    const { actionType, metadata } = req.body || {};
-    if (!actionType) return res.status(400).json({ error: 'actionType is required.' });
-    // Best-effort: store in memory log (extend with a DB model if needed)
-    console.log(`[UserAction] user=${session?.username || 'anon'} action=${actionType}`, metadata || {});
-    return res.json({ message: 'Action recorded.' });
-  } catch (err) {
-    console.error('User action error', err);
-    return res.status(500).json({ error: 'Failed to record action.' });
-  }
+app.post('/api/auth/profile-image', requireSession, async (req, res) => {
+  const { profileImageUrl } = req.body || {};
+  if (!profileImageUrl) return res.status(400).json({ error: 'profileImageUrl is required.' });
+  await User.updateOne({ _id: req.session.user_id }, { $set: { profile_image: String(profileImageUrl).trim() } });
+  return res.json({ message: 'Profile image updated successfully.', profileImageUrl: String(profileImageUrl).trim() });
 });
 
-// GET /api/auth/actions
-app.get('/api/auth/actions', async (req, res) => {
-  return res.json([]);
+app.delete('/api/auth/account', requireSession, async (req, res) => {
+  await Promise.all([User.deleteOne({ _id: req.session.user_id }), AuthSession.deleteMany({ user_id: req.session.user_id }), OtpCode.deleteMany({ user_id: req.session.user_id })]);
+  return res.json({ message: 'Account deleted successfully.' });
 });
 
-// POST /api/auth/voice-challenge
-app.post('/api/auth/voice-challenge', async (req, res) => {
-  try {
-    const phrases = ['blue elephant', 'sunny morning', 'green river', 'open window', 'silver cloud'];
-    const phrase = phrases[Math.floor(Math.random() * phrases.length)];
-    const expiresAt = new Date(Date.now() + 2 * 60 * 1000).toISOString();
-    return res.json({ phrase, expiresAt });
-  } catch (err) {
-    return res.status(500).json({ error: 'Failed to generate voice challenge.' });
-  }
+app.post('/api/auth/user-action', requireSession, async (req, res) => {
+  const { actionType, metadata } = req.body || {};
+  if (!actionType) return res.status(400).json({ error: 'actionType is required.' });
+  await UserAction.create({ _id: uuidv4(), user_id: req.session.user_id, action_type: actionType, metadata_json: JSON.stringify(metadata || {}), created_at: nowIso() });
+  return res.json({ message: 'Action recorded.' });
 });
 
-// POST /api/auth/voice-verify
-app.post('/api/auth/voice-verify', async (req, res) => {
+app.get('/api/auth/actions', requireSession, async (req, res) => {
+  const isAdmin = req.session.role === 'admin';
+  const query = isAdmin ? {} : { user_id: req.session.user_id };
+  const rows = await UserAction.find(query).sort({ created_at: -1 }).limit(100).lean();
+  return res.json(rows.map(r => ({ actionType: r.action_type, metadata: safeJson(r.metadata_json, {}), createdAt: r.created_at, userId: r.user_id })));
+});
+
+app.get('/api/auth/captains', requireSession, async (req, res) => {
+  const { vehicleType } = req.query;
+  const query = vehicleType ? { role: 'captain', captain_vehicle: String(vehicleType) } : { role: 'captain' };
+  const captains = await User.find(query).select('_id username display_name mobile captain_vehicle profile_image').lean();
+  return res.json(captains.map(c => ({ id: c._id, username: c.username, displayName: c.display_name, phone: c.mobile, vehicleType: c.captain_vehicle || undefined, profileImageUrl: c.profile_image || undefined, availability: 'available' })));
+});
+
+app.get('/api/auth/users', requireSession, async (req, res) => {
+  if (req.session.role !== 'admin') return res.status(403).json({ error: 'Admin role required.' });
+  const users = await User.find({}).select('_id username display_name email mobile role captain_vehicle created_at').sort({ created_at: -1 }).lean();
+  return res.json(users.map(u => ({ id: u._id, username: u.username, displayName: u.display_name, email: u.email, mobile: u.mobile, role: u.role, captainVehicle: u.captain_vehicle || undefined, createdAt: u.created_at })));
+});
+
+app.get('/api/auth/users/stats', requireSession, async (req, res) => {
+  if (req.session.role !== 'admin') return res.status(403).json({ error: 'Admin role required.' });
+  const [total, customers, captains, admins] = await Promise.all([User.countDocuments(), User.countDocuments({ role: 'customer' }), User.countDocuments({ role: 'captain' }), User.countDocuments({ role: 'admin' })]);
+  return res.json({ totalUsers: total, totalCustomers: customers, totalCaptains: captains, totalAdmins: admins });
+});
+
+app.post('/api/auth/captain-feedback', requireSession, async (req, res) => {
+  const { bookingId, captainId, captainName, rideRating, captainRating, feedbackText, lovedRide, lovedCaptain } = req.body || {};
+  if (!bookingId || !captainName || !rideRating || !captainRating) return res.status(400).json({ error: 'bookingId, captainName, rideRating, captainRating are required.' });
+  const now = nowIso();
+  const existing = await CaptainFeedback.findOne({ booking_id: String(bookingId) });
+  const data = { captain_user_id: captainId || null, captain_name: String(captainName).trim(), submitted_by_user_id: req.session.user_id, submitted_by_name: req.session.display_name || req.session.username, ride_rating: Number(rideRating), captain_rating: Number(captainRating), feedback_text: feedbackText || null, loved_ride: lovedRide ? 1 : 0, loved_captain: lovedCaptain ? 1 : 0, updated_at: now };
+  if (existing) { await CaptainFeedback.updateOne({ booking_id: String(bookingId) }, { $set: data }); }
+  else { await CaptainFeedback.create({ _id: uuidv4(), booking_id: String(bookingId), ...data, created_at: now }); }
+  return res.json({ message: 'Feedback submitted.' });
+});
+
+app.get('/api/auth/captain-feedback/stats', requireSession, async (req, res) => {
+  if (!['captain','admin'].includes(req.session.role)) return res.status(403).json({ error: 'Captain or admin role required.' });
+  const captainUserId = req.session.role === 'admin' ? (req.query.captainId || '') : req.session.user_id;
+  const allFeedback = await CaptainFeedback.find({ captain_user_id: captainUserId }).lean();
+  const feedbackCount = allFeedback.length;
+  const avgCaptainRating = feedbackCount ? Number((allFeedback.reduce((s,f) => s + Number(f.captain_rating||0), 0) / feedbackCount).toFixed(1)) : 0;
+  const avgRideRating = feedbackCount ? Number((allFeedback.reduce((s,f) => s + Number(f.ride_rating||0), 0) / feedbackCount).toFixed(1)) : 0;
+  const totalHearts = allFeedback.reduce((s,f) => s + Number(f.loved_captain||0) + Number(f.loved_ride||0), 0);
+  const recentComments = await CaptainFeedback.find({ captain_user_id: captainUserId, feedback_text: { $nin: [null,''] } }).sort({ created_at: -1 }).limit(8).lean();
+  return res.json({ feedbackCount, avgCaptainRating, avgRideRating, totalHearts, recentComments: recentComments.map(r => ({ bookingId: r.booking_id, userName: r.submitted_by_name, rideRating: r.ride_rating, captainRating: r.captain_rating, feedbackText: r.feedback_text, lovedRide: toBool(r.loved_ride), lovedCaptain: toBool(r.loved_captain), createdAt: r.created_at })) });
+});
+
+app.post('/api/auth/voice-challenge', requireSession, async (_req, res) => {
+  const phrases = ['confirm secure delivery now', 'my parcel is ready to drop', 'verify identity for delivery'];
+  return res.json({ phrase: phrases[Math.floor(Math.random() * phrases.length)], expiresAt: new Date(Date.now() + 4 * 60 * 1000).toISOString() });
+});
+
+app.post('/api/auth/voice-verify', requireSession, async (_req, res) => {
   return res.json({ message: 'Voice verified successfully.' });
 });
 
-// GET /api/auth/users/stats
-app.get('/api/auth/users/stats', async (req, res) => {
+// ── BOOKINGS ─────────────────────────────────────────────────────────────────
+
+app.get('/api/bookings', requireSession, async (req, res) => {
   try {
-    const token = req.headers['x-session-token'];
-    const session = token ? await getSession(token) : null;
-    if (!session || session.role !== 'admin') return res.status(403).json({ error: 'Admin role required.' });
-    const [total, customers, captains, admins] = await Promise.all([
-      User.countDocuments({}), User.countDocuments({ role: 'customer' }),
-      User.countDocuments({ role: 'captain' }), User.countDocuments({ role: 'admin' })
-    ]);
-    return res.json({ total, customers, captains, admins });
-  } catch (err) {
-    return res.status(500).json({ error: 'Failed to get user stats.' });
-  }
+    const includeCompleted = String(req.query.includeCompleted || '').toLowerCase() === 'true';
+    const maxItems = Math.min(500, Number(req.query.limit || 200));
+    const allRows = await Booking.find({}).sort({ updated_at: -1 }).limit(maxItems).lean();
+    // canAccessBooking: admin=all, customer=own, captain=notificationTarget='all' OR assigned
+    const visible = allRows.filter(row => canAccessBooking(req.session, row));
+    const filtered = visible.filter(row => {
+      if (!includeCompleted && row.status !== 'completed' && row.status !== 'cancelled') return true;
+      if (!includeCompleted && (row.status === 'completed' || row.status === 'cancelled')) return false;
+      return true;
+    });
+    return res.json(filtered.map(mapBookingRow));
+  } catch (err) { console.error('GET /api/bookings error', err); return res.status(500).json({ error: 'Failed to fetch bookings.' }); }
 });
 
-// GET /api/auth/users
-app.get('/api/auth/users', async (req, res) => {
+app.get('/api/bookings/:bookingId', requireSession, async (req, res) => {
+  const booking = await Booking.findById(req.params.bookingId).lean();
+  if (!booking) return res.status(404).json({ error: 'Booking not found.' });
+  if (!canAccessBooking(req.session, booking)) return res.status(403).json({ error: 'Access denied.' });
+  return res.json(mapBookingRow(booking));
+});
+
+app.post('/api/bookings', requireSession, async (req, res) => {
   try {
-    const token = req.headers['x-session-token'];
-    const session = token ? await getSession(token) : null;
-    if (!session || session.role !== 'admin') return res.status(403).json({ error: 'Admin role required.' });
-    const users = await User.find({}).select('_id username display_name email mobile role captain_vehicle profile_image created_at').lean();
-    return res.json(users.map(u => ({
-      id: u._id, username: u.username, displayName: u.display_name || u.username,
-      email: u.email, mobile: u.mobile, role: u.role,
-      captainVehicle: u.captain_vehicle || undefined,
-      profileImageUrl: u.profile_image || undefined,
-      createdAt: u.created_at
-    })));
-  } catch (err) {
-    return res.status(500).json({ error: 'Failed to get users.' });
-  }
-});
-
-// GET /api/auth/captains
-app.get('/api/auth/captains', async (req, res) => {
-  try {
-    const { vehicleType } = req.query;
-    const query = vehicleType ? { role: 'captain', captain_vehicle: String(vehicleType) } : { role: 'captain' };
-    const captains = await User.find(query).select('_id username display_name mobile captain_vehicle profile_image').lean();
-    return res.json(captains.map(c => ({
-      id: c._id, username: c.username, displayName: c.display_name || c.username,
-      mobile: c.mobile, vehicleType: c.captain_vehicle || undefined,
-      profileImageUrl: c.profile_image || undefined
-    })));
-  } catch (err) {
-    return res.status(500).json({ error: 'Failed to get captains.' });
-  }
-});
-
-// POST /api/auth/captain-feedback
-app.post('/api/auth/captain-feedback', async (req, res) => {
-  try {
-    const { bookingId, captainId, captainName, rideRating, captainRating, feedbackText, lovedRide, lovedCaptain } = req.body || {};
-    if (!bookingId || !captainName || !rideRating || !captainRating) {
-      return res.status(400).json({ error: 'bookingId, captainName, rideRating, and captainRating are required.' });
-    }
-    console.log(`[CaptainFeedback] booking=${bookingId} captain=${captainName} rideRating=${rideRating} captainRating=${captainRating}`);
-    return res.json({ message: 'Feedback submitted successfully.' });
-  } catch (err) {
-    return res.status(500).json({ error: 'Failed to submit captain feedback.' });
-  }
-});
-
-// GET /api/auth/captain-feedback/stats
-app.get('/api/auth/captain-feedback/stats', async (req, res) => {
-  return res.json({ totalFeedbacks: 0, averageRideRating: 0, averageCaptainRating: 0, comments: [] });
-});
-
-// KYC routes (captain)
-app.get('/api/auth/kyc/status', async (req, res) => {
-  try {
-    const token = req.headers['x-session-token'];
-    const session = token ? await getSession(token) : null;
-    if (!session) return res.status(401).json({ error: 'Valid session token required.' });
-    return res.json({ kycStatus: 'not_submitted', kycDocumentType: null, kycDocumentNumber: null, kycReferenceId: null, kycUpdatedAt: null });
-  } catch (err) {
-    return res.status(500).json({ error: 'Failed to get KYC status.' });
-  }
-});
-
-app.post('/api/auth/kyc/submit', async (req, res) => {
-  try {
-    const token = req.headers['x-session-token'];
-    const session = token ? await getSession(token) : null;
-    if (!session) return res.status(401).json({ error: 'Valid session token required.' });
-    const { documentType, documentNumber } = req.body || {};
-    if (!documentType || !documentNumber) return res.status(400).json({ error: 'documentType and documentNumber are required.' });
-    const referenceId = `KYC-${uuidv4().split('-')[0].toUpperCase()}`;
-    return res.json({ message: 'KYC submitted successfully.', kycStatus: 'pending', kycReferenceId: referenceId, kycUpdatedAt: nowIso() });
-  } catch (err) {
-    return res.status(500).json({ error: 'Failed to submit KYC.' });
-  }
-});
-
-// ============================================================================
-// BOOKINGS ROUTES
-// ============================================================================
-
-const bookingSchema = new mongoose.Schema({
-  _id: String, user_id: String, username: String, service_type: String,
-  pickup: Object, drop: Object, status: String, captain_id: String,
-  captain_name: String, otp: String, fare: Number, payment_status: String,
-  scheduled_at: String, created_at: String, updated_at: String,
-  food_items: Array, hotel_name: String, medicine_names: String,
-  prescription_payload: String, feedback: Object
-});
-const Booking = mongoose.model('Booking', bookingSchema);
-
-app.get('/api/bookings', async (req, res) => {
-  try {
-    const token = req.headers['x-session-token'];
-    const session = token ? await getSession(token) : null;
-    if (!session) return res.status(401).json({ error: 'Valid session token required.' });
-    const isAdmin = session.role === 'admin';
-    const query = isAdmin ? {} : { user_id: session.user_id };
-    const bookings = await Booking.find(query).sort({ updated_at: -1 }).limit(200).lean();
-    return res.json(bookings.map(b => normalizeBooking(b)));
-  } catch (err) {
-    console.error('GET /api/bookings error', err);
-    return res.status(500).json({ error: 'Failed to fetch bookings.' });
-  }
-});
-
-app.get('/api/bookings/:bookingId', async (req, res) => {
-  try {
-    const token = req.headers['x-session-token'];
-    const session = token ? await getSession(token) : null;
-    if (!session) return res.status(401).json({ error: 'Valid session token required.' });
-    const booking = await Booking.findById(req.params.bookingId).lean();
-    if (!booking) return res.status(404).json({ error: 'Booking not found.' });
-    return res.json(normalizeBooking(booking));
-  } catch (err) {
-    return res.status(500).json({ error: 'Failed to fetch booking.' });
-  }
-});
-
-app.post('/api/bookings', async (req, res) => {
-  try {
-    const token = req.headers['x-session-token'];
-    const session = token ? await getSession(token) : null;
-    if (!session) return res.status(401).json({ error: 'Valid session token required.' });
     const body = req.body || {};
-    const bookingId = uuidv4();
-    const otp = `${Math.floor(1000 + Math.random() * 9000)}`;
-    const booking = await Booking.create({
+    const now = nowIso();
+    const pickup = body.pickup || {};
+    const drop = body.drop || {};
+    if (!pickup.address || !drop.address) return res.status(400).json({ error: 'pickup and drop addresses are required.' });
+    const otp = genOtp();
+    const bookingId = `BK-${Date.now().toString().slice(-8)}`;
+    const notificationTarget = body.notificationTarget || 'all';   // ← DEFAULT 'all'
+    await Booking.create({
       _id: bookingId,
-      user_id: session.user_id,
-      username: session.username,
+      user_id: req.session.user_id,
+      user_name: req.session.display_name || req.session.username || 'Customer',
+      booking_for: body.bookingFor || 'self',
+      recipient_name: body.recipientName || null, recipient_phone: body.recipientPhone || null,
+      is_scheduled: 0, scheduled_at: body.scheduledAt || null,
       service_type: body.serviceType || 'parcel',
-      pickup: body.pickup || {},
-      drop: body.drop || {},
-      status: 'pending',
-      otp,
-      fare: body.fare || 0,
-      payment_status: 'pending',
-      scheduled_at: body.scheduledAt || null,
-      food_items: body.foodItems || [],
-      hotel_name: body.hotelName || null,
-      medicine_names: body.medicineNames || null,
-      created_at: nowIso(),
-      updated_at: nowIso()
+      payment_method: body.paymentMethod || 'cash',
+      vehicle_type: body.vehicleType || 'bike',
+      pickup_json: JSON.stringify({ address: String(pickup.address), lat: Number(pickup.lat||0), lng: Number(pickup.lng||0) }),
+      drop_json: JSON.stringify({ address: String(drop.address), lat: Number(drop.lat||0), lng: Number(drop.lng||0) }),
+      current_location_json: JSON.stringify({ address: String(pickup.address), lat: Number(pickup.lat||0), lng: Number(pickup.lng||0) }),
+      status: 'created',   // ← 'created' so captain alert fires
+      otp, otp_verified: 0,
+      driver_name: body.captainName || 'Ravi Kumar',
+      driver_phone: body.captainPhone || '+91-90000-12345',
+      captain_id: body.captainId || null,
+      notification_target: notificationTarget,  // ← 'all' = every captain receives alert
+      preferred_captain_id: body.preferredCaptainId || null,
+      preferred_captain_name: body.preferredCaptainName || null,
+      notification: notificationTarget === 'all' ? `Booking confirmed. OTP ${otp}. Broadcast to all captains.` : `Booking confirmed. OTP ${otp}. Preferred captain notified.`,
+      estimated_fare: body.estimatedFare != null ? Number(body.estimatedFare) : null,
+      ride_notes: body.rideNotes || null,
+      sos_triggered: 0, sos_by_role: null, feedback_submitted: 0, feedback_submitted_at: null,
+      feedback_text: null, ride_rating: null, captain_rating: null,
+      loved_ride: 0, loved_captain: 0, final_amount: null, payment_done: 0, payment_done_at: null,
+      tracking_closed: 0, tracking_closed_at: null,
+      created_at: now, updated_at: now
     });
-    return res.status(201).json(normalizeBooking(booking.toObject()));
-  } catch (err) {
-    console.error('POST /api/bookings error', err);
-    return res.status(500).json({ error: 'Failed to create booking.' });
-  }
+    const created = await Booking.findById(bookingId).lean();
+    return res.status(201).json(mapBookingRow(created));
+  } catch (err) { console.error('POST /api/bookings error', err); return res.status(500).json({ error: 'Failed to create booking.' }); }
 });
 
-app.post('/api/bookings/:bookingId/verify-otp', async (req, res) => {
-  try {
-    const token = req.headers['x-session-token'];
-    const session = token ? await getSession(token) : null;
-    if (!session) return res.status(401).json({ error: 'Valid session token required.' });
-    const { otp } = req.body || {};
-    const booking = await Booking.findById(req.params.bookingId);
-    if (!booking) return res.status(404).json({ error: 'Booking not found.' });
-    if (booking.otp !== String(otp).trim()) return res.status(400).json({ error: 'Invalid OTP.' });
-    booking.status = 'in_progress';
-    booking.updated_at = nowIso();
-    await booking.save();
-    return res.json(normalizeBooking(booking.toObject()));
-  } catch (err) {
-    return res.status(500).json({ error: 'Failed to verify OTP.' });
-  }
+app.post('/api/bookings/:bookingId/approve', requireSession, async (req, res) => {
+  const booking = await Booking.findById(req.params.bookingId).lean();
+  if (!booking) return res.status(404).json({ error: 'Booking not found.' });
+  if (!canAccessBooking(req.session, booking)) return res.status(403).json({ error: 'Access denied.' });
+  if (booking.status !== 'created') return res.status(400).json({ error: 'Booking is no longer available.' });
+  await Booking.updateOne({ _id: booking._id }, { $set: { status: 'assigned', notification: 'Captain accepted the ride and is on the way.', updated_at: nowIso() } });
+  return res.json(mapBookingRow(await Booking.findById(booking._id).lean()));
 });
 
-app.post('/api/bookings/:bookingId/approve', async (req, res) => {
-  try {
-    const token = req.headers['x-session-token'];
-    const session = token ? await getSession(token) : null;
-    if (!session) return res.status(401).json({ error: 'Valid session token required.' });
-    const booking = await Booking.findById(req.params.bookingId);
-    if (!booking) return res.status(404).json({ error: 'Booking not found.' });
-    booking.status = 'captain_assigned';
-    booking.captain_id = session.user_id;
-    booking.captain_name = session.username;
-    booking.updated_at = nowIso();
-    await booking.save();
-    return res.json(normalizeBooking(booking.toObject()));
-  } catch (err) {
-    return res.status(500).json({ error: 'Failed to approve booking.' });
-  }
+app.post('/api/bookings/:bookingId/verify-otp', requireSession, async (req, res) => {
+  const { otp } = req.body || {};
+  const booking = await Booking.findById(req.params.bookingId).lean();
+  if (!booking) return res.status(404).json({ error: 'Booking not found.' });
+  if (!canAccessBooking(req.session, booking)) return res.status(403).json({ error: 'Access denied.' });
+  if (String(booking.otp).trim() !== String(otp||'').trim()) return res.status(400).json({ error: 'Invalid OTP.' });
+  await Booking.updateOne({ _id: booking._id }, { $set: { otp_verified: 1, status: 'assigned', notification: 'OTP verified. Ride started.', updated_at: nowIso() } });
+  return res.json(mapBookingRow(await Booking.findById(booking._id).lean()));
 });
 
-app.post('/api/bookings/:bookingId/cancel', async (req, res) => {
-  try {
-    const token = req.headers['x-session-token'];
-    const session = token ? await getSession(token) : null;
-    if (!session) return res.status(401).json({ error: 'Valid session token required.' });
-    const booking = await Booking.findById(req.params.bookingId);
-    if (!booking) return res.status(404).json({ error: 'Booking not found.' });
-    booking.status = 'cancelled';
-    booking.updated_at = nowIso();
-    await booking.save();
-    return res.json(normalizeBooking(booking.toObject()));
-  } catch (err) {
-    return res.status(500).json({ error: 'Failed to cancel booking.' });
-  }
+app.post('/api/bookings/:bookingId/cancel', requireSession, async (req, res) => {
+  const booking = await Booking.findById(req.params.bookingId).lean();
+  if (!booking) return res.status(404).json({ error: 'Booking not found.' });
+  if (!canAccessBooking(req.session, booking)) return res.status(403).json({ error: 'Access denied.' });
+  if (['completed','cancelled'].includes(booking.status)) return res.status(400).json({ error: 'Cannot cancel this booking.' });
+  await Booking.updateOne({ _id: booking._id }, { $set: { status: 'cancelled', notification: `Ride cancelled by ${req.body.role || 'user'}.`, updated_at: nowIso() } });
+  return res.json(mapBookingRow(await Booking.findById(booking._id).lean()));
 });
 
-app.post('/api/bookings/:bookingId/sos', async (req, res) => {
-  try {
-    console.log(`[SOS] bookingId=${req.params.bookingId}`);
-    return res.json({ message: 'SOS alert sent. Help is on the way.' });
-  } catch (err) {
-    return res.status(500).json({ error: 'Failed to send SOS.' });
-  }
+app.post('/api/bookings/:bookingId/sos', requireSession, async (req, res) => {
+  const booking = await Booking.findById(req.params.bookingId).lean();
+  if (!booking) return res.status(404).json({ error: 'Booking not found.' });
+  await Booking.updateOne({ _id: booking._id }, { $set: { sos_triggered: 1, sos_by_role: req.body.role || 'customer', notification: 'SOS triggered. Emergency help alerted.', updated_at: nowIso() } });
+  return res.json(mapBookingRow(await Booking.findById(booking._id).lean()));
 });
 
-app.post('/api/bookings/:bookingId/feedback', async (req, res) => {
-  try {
-    const booking = await Booking.findById(req.params.bookingId);
-    if (!booking) return res.status(404).json({ error: 'Booking not found.' });
-    booking.feedback = req.body || {};
-    booking.updated_at = nowIso();
-    await booking.save();
-    return res.json(normalizeBooking(booking.toObject()));
-  } catch (err) {
-    return res.status(500).json({ error: 'Failed to save feedback.' });
-  }
+app.post('/api/bookings/:bookingId/feedback', requireSession, async (req, res) => {
+  const booking = await Booking.findById(req.params.bookingId).lean();
+  if (!booking) return res.status(404).json({ error: 'Booking not found.' });
+  const { rideRating, captainRating, feedbackText, lovedRide, lovedCaptain } = req.body || {};
+  await Booking.updateOne({ _id: booking._id }, { $set: { feedback_submitted: 1, feedback_submitted_at: nowIso(), ride_rating: Number(rideRating||0), captain_rating: Number(captainRating||0), feedback_text: feedbackText || null, loved_ride: lovedRide ? 1 : 0, loved_captain: lovedCaptain ? 1 : 0, notification: 'Feedback submitted. Thank you!', updated_at: nowIso() } });
+  return res.json(mapBookingRow(await Booking.findById(booking._id).lean()));
 });
 
-app.post('/api/bookings/:bookingId/pay', async (req, res) => {
-  try {
-    const booking = await Booking.findById(req.params.bookingId);
-    if (!booking) return res.status(404).json({ error: 'Booking not found.' });
-    booking.payment_status = 'paid';
-    booking.status = 'completed';
-    booking.updated_at = nowIso();
-    await booking.save();
-    return res.json(normalizeBooking(booking.toObject()));
-  } catch (err) {
-    return res.status(500).json({ error: 'Failed to process payment.' });
-  }
+app.post('/api/bookings/:bookingId/pay', requireSession, async (req, res) => {
+  const booking = await Booking.findById(req.params.bookingId).lean();
+  if (!booking) return res.status(404).json({ error: 'Booking not found.' });
+  const finalAmount = Number(req.body.amount || booking.estimated_fare || 0);
+  await Booking.updateOne({ _id: booking._id }, { $set: { final_amount: finalAmount, payment_done: 1, payment_done_at: nowIso(), notification: `Payment of Rs ${finalAmount} completed.`, updated_at: nowIso() } });
+  return res.json(mapBookingRow(await Booking.findById(booking._id).lean()));
 });
 
-app.post('/api/bookings/:bookingId/close-tracking', async (req, res) => {
-  try {
-    const booking = await Booking.findById(req.params.bookingId);
-    if (!booking) return res.status(404).json({ error: 'Booking not found.' });
-    booking.status = 'completed';
-    booking.updated_at = nowIso();
-    await booking.save();
-    return res.json(normalizeBooking(booking.toObject()));
-  } catch (err) {
-    return res.status(500).json({ error: 'Failed to close tracking.' });
-  }
+app.post('/api/bookings/:bookingId/close-tracking', requireSession, async (req, res) => {
+  const booking = await Booking.findById(req.params.bookingId).lean();
+  if (!booking) return res.status(404).json({ error: 'Booking not found.' });
+  await Booking.updateOne({ _id: booking._id }, { $set: { tracking_closed: 1, tracking_closed_at: nowIso(), status: 'completed', notification: 'Tracking closed. Trip completed.', updated_at: nowIso() } });
+  return res.json(mapBookingRow(await Booking.findById(booking._id).lean()));
 });
 
-function normalizeBooking(b) {
-  return {
-    id: b._id, userId: b.user_id, userName: b.username,
-    serviceType: b.service_type, pickup: b.pickup || {}, drop: b.drop || {},
-    status: b.status, captainId: b.captain_id || null,
-    captainName: b.captain_name || null, otp: b.otp,
-    fare: b.fare || 0, paymentStatus: b.payment_status || 'pending',
-    scheduledAt: b.scheduled_at || null,
-    foodItems: b.food_items || [], hotelName: b.hotel_name || null,
-    medicineNames: b.medicine_names || null, feedback: b.feedback || null,
-    createdAt: b.created_at, updatedAt: b.updated_at
-  };
-}
-
-// ============================================================================
-// PLACES / HOTELS / MENU ROUTES
-// ============================================================================
-
-app.get('/api/places/nearby-hotels', async (req, res) => {
-  const now = new Date().toISOString();
-  return res.json({
-    source: 'backend',
-    updatedAt: now,
-    hotels: [
-      {
-        id: 'h1',
-        name: 'Spice Garden',
-        category: 'nonveg',
-        cuisine: 'Indian',
-        locationLabel: 'Near City Center',
-        distanceKm: 1.2,
-        etaMinutes: 15,
-        rating: 4.2,
-        openNow: true,
-        priceForTwo: 250,
-        imageUrl: ''
-      },
-      {
-        id: 'h2',
-        name: 'Pizza Palace',
-        category: 'veg',
-        cuisine: 'Italian',
-        locationLabel: 'MG Road',
-        distanceKm: 0.8,
-        etaMinutes: 10,
-        rating: 4.5,
-        openNow: true,
-        priceForTwo: 400,
-        imageUrl: ''
-      },
-      {
-        id: 'h3',
-        name: 'Burger Hub',
-        category: 'nonveg',
-        cuisine: 'Fast Food',
-        locationLabel: 'Bus Stand Area',
-        distanceKm: 2.1,
-        etaMinutes: 20,
-        rating: 4.0,
-        openNow: true,
-        priceForTwo: 300,
-        imageUrl: ''
-      },
-      {
-        id: 'h4',
-        name: 'Green Bites',
-        category: 'veg',
-        cuisine: 'Healthy',
-        locationLabel: 'Park Street',
-        distanceKm: 1.5,
-        etaMinutes: 18,
-        rating: 4.3,
-        openNow: true,
-        priceForTwo: 200,
-        imageUrl: ''
-      }
-    ]
-  });
-});
-
-app.get('/api/menu/hotels/:hotelId/items', async (req, res) => {
-  const now = new Date().toISOString();
-  // Menu varies slightly per hotel for realism
-  const hotelMenus = {
-    h1: [
-      { id: 'i1', name: 'Special Thali', price: 120, description: 'Full veg meal', category: 'veg', isTop: true, imageUrl: '' },
-      { id: 'i2', name: 'Chicken Curry', price: 160, description: 'Rich gravy', category: 'nonveg', isTop: true, imageUrl: '' },
-      { id: 'i3', name: 'Butter Naan', price: 30, description: 'Soft naan', category: 'veg', isTop: false, imageUrl: '' },
-      { id: 'i4', name: 'Masala Chai', price: 20, description: 'Hot tea', category: 'veg', isTop: false, imageUrl: '' }
-    ],
-    h2: [
-      { id: 'i5', name: 'Margherita Pizza', price: 180, description: 'Classic pizza', category: 'veg', isTop: true, imageUrl: '' },
-      { id: 'i6', name: 'Pepperoni Pizza', price: 220, description: 'Loaded pepperoni', category: 'nonveg', isTop: true, imageUrl: '' },
-      { id: 'i7', name: 'Garlic Bread', price: 60, description: 'Crispy garlic bread', category: 'veg', isTop: false, imageUrl: '' }
-    ],
-    h3: [
-      { id: 'i8', name: 'Classic Burger', price: 90, description: 'Juicy beef burger', category: 'nonveg', isTop: true, imageUrl: '' },
-      { id: 'i9', name: 'Veg Burger', price: 70, description: 'Crispy veg patty', category: 'veg', isTop: true, imageUrl: '' },
-      { id: 'i10', name: 'French Fries', price: 50, description: 'Golden fries', category: 'veg', isTop: false, imageUrl: '' }
-    ],
-    h4: [
-      { id: 'i11', name: 'Veg Biryani', price: 90, description: 'Fragrant basmati rice', category: 'veg', isTop: true, imageUrl: '' },
-      { id: 'i12', name: 'Fruit Bowl', price: 80, description: 'Fresh seasonal fruits', category: 'veg', isTop: true, imageUrl: '' },
-      { id: 'i13', name: 'Quinoa Salad', price: 110, description: 'Healthy protein salad', category: 'veg', isTop: false, imageUrl: '' }
-    ]
-  };
-  const items = hotelMenus[req.params.hotelId] || hotelMenus['h1'];
-  return res.json({
-    source: 'backend',
-    hotelId: req.params.hotelId,
-    updatedAt: now,
-    items
-  });
-});
-
-// ============================================================================
-// PRICING ROUTE
-// ============================================================================
-
-app.post('/api/pricing/live-fare', async (req, res) => {
-  try {
-    const { distanceKm, vehicleType, trafficCondition, weatherCondition } = req.body || {};
-    const distance = Number(distanceKm || 5);
-    const baseRate = vehicleType === 'bike' ? 8 : vehicleType === 'auto' ? 12 : 18;
-    const trafficMultiplier = trafficCondition === 'heavy' ? 1.3 : trafficCondition === 'moderate' ? 1.15 : 1.0;
-    const weatherMultiplier = weatherCondition === 'rain' ? 1.2 : 1.0;
-    const distanceFare = Math.round(distance * baseRate * trafficMultiplier * weatherMultiplier);
-    return res.json({
-      distanceFare, trafficMultiplier, weatherMultiplier,
-      totalFare: distanceFare, trafficCondition: trafficCondition || 'clear',
-      weatherCondition: weatherCondition || 'clear'
-    });
-  } catch (err) {
-    return res.status(500).json({ error: 'Failed to calculate fare.' });
-  }
-});
-
-// ============================================================================
-// INTEGRATIONS HEALTH ROUTE
-// ============================================================================
+// ── MISC ─────────────────────────────────────────────────────────────────────
 
 app.get('/api/integrations/health', async (_req, res) => {
-  const mongoConnected = mongoose.connection.readyState === 1;
-  return res.json({
-    service: 'ekart-backend',
-    status: mongoConnected ? 'ok' : 'degraded',
-    checkedAt: nowIso(),
-    integrations: [
-      { name: 'MongoDB', status: mongoConnected ? 'live' : 'down' },
-      { name: 'Auth API', status: 'live' },
-      { name: 'Booking API', status: 'live' }
-    ]
-  });
+  const mongoOk = mongoose.connection.readyState === 1;
+  return res.json({ service: 'routex-backend', status: mongoOk ? 'ok' : 'degraded', checkedAt: nowIso(), integrations: [{ name: 'MongoDB', status: mongoOk ? 'live' : 'down' }, { name: 'Auth API', status: 'live' }, { name: 'Booking API', status: 'live' }] });
 });
 
-// Error handling
+app.get('/api/places/nearby-hotels', (_req, res) => {
+  return res.json({ source: 'backend', updatedAt: nowIso(), hotels: [
+    { id: 'h1', name: 'Spice Garden', category: 'nonveg', cuisine: 'Indian', locationLabel: 'City Center', distanceKm: 1.2, etaMinutes: 15, rating: 4.2, openNow: true, priceForTwo: 250 },
+    { id: 'h2', name: 'Pizza Palace', category: 'veg', cuisine: 'Italian', locationLabel: 'MG Road', distanceKm: 0.8, etaMinutes: 10, rating: 4.5, openNow: true, priceForTwo: 400 },
+    { id: 'h3', name: 'Burger Hub', category: 'nonveg', cuisine: 'Fast Food', locationLabel: 'Bus Stand', distanceKm: 2.1, etaMinutes: 20, rating: 4.0, openNow: true, priceForTwo: 300 }
+  ]});
+});
+
+app.get('/api/menu/hotels/:hotelId/items', (req, res) => {
+  const menus = {
+    h1: [{ id:'i1', name:'Special Thali', price:120, description:'Full meal', category:'veg', isTop:true }, { id:'i2', name:'Chicken Curry', price:160, description:'Rich gravy', category:'nonveg', isTop:true }],
+    h2: [{ id:'i5', name:'Margherita Pizza', price:180, description:'Classic', category:'veg', isTop:true }, { id:'i6', name:'Pepperoni Pizza', price:220, description:'Loaded', category:'nonveg', isTop:true }],
+    h3: [{ id:'i8', name:'Classic Burger', price:90, description:'Juicy', category:'nonveg', isTop:true }, { id:'i9', name:'Veg Burger', price:70, description:'Crispy', category:'veg', isTop:true }]
+  };
+  return res.json({ source:'backend', hotelId: req.params.hotelId, updatedAt: nowIso(), items: menus[req.params.hotelId] || menus.h1 });
+});
+
+app.post('/api/pricing/live-fare', async (req, res) => {
+  const { vehicleType } = req.body || {};
+  const rates = { bike:8, auto:12, scooter:10, car:18, van:22, truck:28 };
+  const rate = rates[vehicleType] || 12;
+  return res.json({ distanceKm: 5, durationInTrafficMinutes: 20, trafficCondition: 'medium', weatherCondition: 'clear', breakdown: { baseFare: 55, distanceFare: rate*5, total: 55 + rate*5 } });
+});
+
+app.post('/api/promos/validate', (req, res) => {
+  const catalog = [{ code:'SAVE10', type:'percent', value:10, minAmount:120 }, { code:'FLAT50', type:'flat', value:50, minAmount:250 }, { code:'FIRST100', type:'flat', value:100, minAmount:500 }];
+  const promo = catalog.find(p => p.code === String(req.body.code||'').toUpperCase());
+  if (!promo) return res.status(404).json({ valid: false, error: 'Invalid promo code.' });
+  const amount = Number(req.body.amount || 0);
+  if (amount < promo.minAmount) return res.status(400).json({ valid: false, error: `Minimum Rs ${promo.minAmount} required.` });
+  const discount = promo.type === 'flat' ? promo.value : Math.round(amount * promo.value / 100);
+  return res.json({ valid: true, code: promo.code, discount, payableAmount: Math.max(0, amount - discount) });
+});
+
+app.post('/api/support/complaints', async (req, res) => {
+  const { type, subject, description } = req.body || {};
+  if (!type || !subject || !description) return res.status(400).json({ error: 'type, subject, description required.' });
+  console.log(`[Support] type=${type} subject=${subject}`);
+  return res.status(201).json({ message: 'Complaint submitted successfully.' });
+});
+
+app.post('/api/support/app-feedback', async (req, res) => {
+  console.log('[AppFeedback]', req.body);
+  return res.status(201).json({ message: 'App feedback submitted successfully.' });
+});
+
+// Error handler
 app.use((err, _req, res, _next) => {
   console.error('Unhandled error', err);
   res.status(500).json({ error: 'Internal server error.' });
 });
 
 // ============================================================================
-// STARTUP
+// START
 // ============================================================================
 
 async function start() {
   try {
     console.log('Connecting to MongoDB...');
     await mongoose.connect(mongoUri);
-    console.log('MongoDB connected successfully!');
-
-    await seedDatabase();
-
+    console.log('MongoDB connected!');
     app.listen(port, () => {
-      console.log(`ekart-backend listening on :${port}`);
-      console.log(`mode: ${authOnlyMode ? 'auth-only' : 'full'}`);
+      console.log(`routex-backend listening on :${port}`);
     });
-
-    // Start worker
-    if (!authOnlyMode && orderQueue) {
-      const worker = new Worker('order-fulfillment', async (job) => {
-        console.log(`Processing job ${job.id}: ${JSON.stringify(job.data)}`);
-        // Simulate order fulfillment
-        await new Promise(resolve => setTimeout(resolve, 5000));
-        console.log(`Job ${job.id} completed`);
-        return { success: true };
-      }, { connection: redisConnection });
-
-      worker.on('failed', (job, err) => {
-        console.error(`Job ${job.id} failed:`, err.message);
-      });
-
-      console.log('Order fulfillment worker started');
-    }
-  } catch (error) {
-    console.error('Failed to start backend', error);
+  } catch (err) {
+    console.error('Failed to start', err);
     process.exit(1);
   }
 }
