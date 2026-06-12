@@ -1,630 +1,722 @@
-const fs = require('fs');
-const path = require('path');
-const dotenv = require('dotenv');
-const express = require('express');
-const cors = require('cors');
-const morgan = require('morgan');
-const mongoose = require('mongoose');
-const { v4: uuidv4 } = require('uuid');
-const bcrypt = require('bcryptjs');
-const sgMail = require('@sendgrid/mail');
-const nodemailer = require('nodemailer');
-const twilio = require('twilio');
+import { Injectable } from '@angular/core';
+import { HttpClient, HttpHeaders } from '@angular/common/http';
+import { BehaviorSubject, Observable, catchError, distinctUntilChanged, fromEvent, interval, map, of, retry, switchMap, timer } from 'rxjs';
+import { Booking, BookingRequest, BookingStatus } from '../models/delivery.models';
+import { NotificationService } from './notification.service';
+import { AuthService } from './auth.service';
+import { environment } from '../../../environments/environment';
 
-dotenv.config();
+const STORAGE_KEY = 'delivery_bookings';
+const BOOKINGS_API = `${environment.parcelApiBase}/api/bookings`;
+const EVENTS_API = `${environment.parcelApiBase}/api/events`;
+const BROADCAST_CHANNEL_NAME = 'routex_bookings';
 
-const port = Number(process.env.PORT || 3000);
-const mongoUri = process.env.MONGODB_URI;
-const redisHost = process.env.REDIS_HOST || 'localhost';
-const redisPort = Number(process.env.REDIS_PORT || 6379);
-const otpDebugMode = process.env.OTP_DEBUG_MODE === '1';
+@Injectable({ providedIn: 'root' })
+export class BookingService {
+  private static readonly FOOD_CONFIRMATION_DELAY_MINUTES = 2;
+  private static readonly CAPTAIN_ACCEPT_TIMEOUT_MINUTES = 20;
+  private readonly bookingsSubject = new BehaviorSubject<Booking[]>(this.loadBookings());
+  readonly bookings$: Observable<Booking[]> = this.bookingsSubject.asObservable();
+  private readonly notifiedBookingIds = new Set<string>();
+  private broadcastChannel: BroadcastChannel | null = null;
+  private eventSource: EventSource | null = null;
+  private sseRetryTimer: ReturnType<typeof setTimeout> | null = null;
 
-if (!mongoUri) {
-  console.error('ERROR: MONGODB_URI environment variable is not set');
-  process.exit(1);
-}
+  constructor(
+    private notifications: NotificationService,
+    private http: HttpClient,
+    private auth: AuthService
+  ) {
+    // Wake up Render free-tier server on app start (avoids first-request cold start delay)
+    this.http.get(`${environment.parcelApiBase}/health`, { responseType: 'text' })
+      .subscribe({ error: () => void 0 });
+    // Re-ping every 5 minutes to keep Render server awake
+    interval(5 * 60 * 1000)
+      .subscribe(() => this.http.get(`${environment.parcelApiBase}/health`, { responseType: 'text' })
+        .subscribe({ error: () => void 0 }));
 
-const sendgridApiKey = process.env.SENDGRID_API_KEY || '';
-const sendgridFromEmail = process.env.SENDGRID_FROM_EMAIL || '';
-const gmailUser = process.env.GMAIL_USER || '';
-const gmailAppPassword = process.env.GMAIL_APP_PASSWORD || '';
-const gmailFromEmail = process.env.GMAIL_FROM_EMAIL || gmailUser;
-const twilioAccountSid = process.env.TWILIO_ACCOUNT_SID || '';
-const twilioAuthToken = process.env.TWILIO_AUTH_TOKEN || '';
-const twilioFromNumber = process.env.TWILIO_FROM_NUMBER || '';
-
-let twilioClient = null;
-let gmailTransporter = null;
-
-if (sendgridApiKey) sgMail.setApiKey(sendgridApiKey);
-if (twilioAccountSid && twilioAuthToken) twilioClient = twilio(twilioAccountSid, twilioAuthToken);
-if (gmailUser && gmailAppPassword) {
-  gmailTransporter = nodemailer.createTransport({ service: 'gmail', auth: { user: gmailUser, pass: gmailAppPassword } });
-}
-
-// ============================================================================
-// DATABASE SCHEMAS
-// ============================================================================
-
-const userSchema = new mongoose.Schema({
-  _id: String, username: String, display_name: String, password: String,
-  email: String, mobile: String, role: String, customer_otp_completed: Number,
-  captain_vehicle: String, profile_image: String, created_at: String, updated_at: String
-});
-
-const otpCodeSchema = new mongoose.Schema({
-  _id: String, user_id: String, session_token: String, channel: String,
-  code: String, consumed: Number, created_at: String, expires_at: String
-});
-
-const authSessionSchema = new mongoose.Schema({
-  _id: String, token: String, user_id: String, type: { type: String, default: 'session' },
-  mfa_verified: Number, voice_verified: Number, created_at: String, expires_at: String
-});
-
-// ── BOOKING SCHEMA — full fields matching frontend Booking interface ──
-const bookingSchema = new mongoose.Schema({
-  _id: String,
-  user_id: String, user_name: String,
-  booking_for: String,
-  recipient_name: String, recipient_phone: String,
-  is_scheduled: Number, scheduled_at: String,
-  service_type: String, payment_method: String, vehicle_type: String,
-  pickup_json: String, drop_json: String, current_location_json: String,
-  status: String,                     // 'created' | 'assigned' | 'in_transit' | 'completed' | 'cancelled'
-  otp: String, otp_verified: Number,
-  driver_name: String, driver_phone: String,
-  captain_id: String,
-  notification_target: String,        // 'all' | 'preferred'  — CRITICAL for captain visibility
-  preferred_captain_id: String, preferred_captain_name: String,
-  notification: String,
-  estimated_fare: Number,
-  ride_notes: String,
-  sos_triggered: Number, sos_by_role: String,
-  feedback_submitted: Number, feedback_submitted_at: String,
-  feedback_text: String, ride_rating: Number, captain_rating: Number,
-  loved_ride: Number, loved_captain: Number,
-  final_amount: Number, payment_done: Number, payment_done_at: String,
-  tracking_closed: Number, tracking_closed_at: String,
-  created_at: String, updated_at: String
-});
-
-const captainFeedbackSchema = new mongoose.Schema({
-  _id: String, booking_id: String, captain_user_id: String, captain_name: String,
-  submitted_by_user_id: String, submitted_by_name: String,
-  ride_rating: Number, captain_rating: Number, feedback_text: String,
-  loved_ride: Number, loved_captain: Number, created_at: String, updated_at: String
-});
-
-const userActionSchema = new mongoose.Schema({
-  _id: String, user_id: String, action_type: String,
-  metadata_json: String, created_at: String
-});
-
-const User = mongoose.model('User', userSchema);
-const OtpCode = mongoose.model('OtpCode', otpCodeSchema);
-const AuthSession = mongoose.model('AuthSession', authSessionSchema);
-const Booking = mongoose.model('Booking', bookingSchema);
-const CaptainFeedback = mongoose.model('CaptainFeedback', captainFeedbackSchema);
-const UserAction = mongoose.model('UserAction', userActionSchema);
-
-// ============================================================================
-// UTILITIES
-// ============================================================================
-
-function nowIso() { return new Date().toISOString(); }
-function genOtp() { return `${Math.floor(100000 + Math.random() * 900000)}`; }
-function toBool(v) { return Number(v || 0) === 1; }
-function safeJson(text, fallback) { try { return JSON.parse(text); } catch { return fallback; } }
-
-function mapBookingRow(row) {
-  return {
-    id: row._id,
-    userId: row.user_id,
-    userName: row.user_name,
-    bookingFor: row.booking_for,
-    recipientName: row.recipient_name || undefined,
-    recipientPhone: row.recipient_phone || undefined,
-    isScheduled: toBool(row.is_scheduled),
-    scheduledAt: row.scheduled_at || undefined,
-    serviceType: row.service_type,
-    paymentMethod: row.payment_method,
-    vehicleType: row.vehicle_type,
-    pickup: safeJson(row.pickup_json, { lat: 0, lng: 0, address: '' }),
-    drop: safeJson(row.drop_json, { lat: 0, lng: 0, address: '' }),
-    currentLocation: safeJson(row.current_location_json, { lat: 0, lng: 0, address: '' }),
-    status: row.status,
-    otp: row.otp,
-    otpVerified: toBool(row.otp_verified),
-    driverName: row.driver_name,
-    driverPhone: row.driver_phone,
-    captainId: row.captain_id || undefined,
-    notificationTarget: row.notification_target || 'all',   // ← DEFAULT 'all' so captains always see it
-    preferredCaptainId: row.preferred_captain_id || undefined,
-    preferredCaptainName: row.preferred_captain_name || undefined,
-    notification: row.notification,
-    estimatedFare: row.estimated_fare != null ? Number(row.estimated_fare) : undefined,
-    rideNotes: row.ride_notes || undefined,
-    sosTriggered: toBool(row.sos_triggered),
-    sosByRole: row.sos_by_role || undefined,
-    feedbackSubmitted: toBool(row.feedback_submitted),
-    feedbackSubmittedAt: row.feedback_submitted_at || undefined,
-    feedbackText: row.feedback_text || undefined,
-    rideRating: row.ride_rating != null ? Number(row.ride_rating) : undefined,
-    captainRating: row.captain_rating != null ? Number(row.captain_rating) : undefined,
-    lovedRide: toBool(row.loved_ride),
-    lovedCaptain: toBool(row.loved_captain),
-    finalAmount: row.final_amount != null ? Number(row.final_amount) : undefined,
-    paymentDone: toBool(row.payment_done),
-    paymentDoneAt: row.payment_done_at || undefined,
-    trackingClosed: toBool(row.tracking_closed),
-    trackingClosedAt: row.tracking_closed_at || undefined,
-    createdAt: row.created_at,
-    updatedAt: row.updated_at
-  };
-}
-
-// ── Captain can see booking if notificationTarget='all' OR they are assigned ──
-function isCaptainAssignedToBooking(session, row) {
-  const target = String(row.notification_target || 'all').trim().toLowerCase();
-  if (target === 'all') return true;   // ← BROADCAST: every captain sees it
-  const cId   = String(session.user_id || '').toLowerCase();
-  const cUser = String(session.username || '').toLowerCase();
-  const cName = String(session.display_name || '').toLowerCase();
-  return (
-    (row.captain_id && String(row.captain_id).toLowerCase() === cId) ||
-    (row.preferred_captain_id && String(row.preferred_captain_id).toLowerCase() === cId) ||
-    (row.driver_name && String(row.driver_name).toLowerCase() === cUser) ||
-    (row.preferred_captain_name && String(row.preferred_captain_name).toLowerCase() === cName)
-  );
-}
-
-function canAccessBooking(session, row) {
-  const role = String(session.role || '').toLowerCase();
-  if (role === 'admin') return true;
-  if (role === 'customer') return String(row.user_id || '') === String(session.user_id || '');
-  if (role === 'captain') return isCaptainAssignedToBooking(session, row);
-  return false;
-}
-
-// ============================================================================
-// SESSION HELPERS
-// ============================================================================
-
-async function issueTempToken(userId) {
-  const token = `tmp_${uuidv4()}`;
-  await AuthSession.create({ _id: uuidv4(), user_id: userId, token, type: 'temp', mfa_verified: 0, voice_verified: 0, expires_at: new Date(Date.now() + 10 * 60 * 1000).toISOString(), created_at: nowIso() });
-  return token;
-}
-
-async function issueSessionToken(userId) {
-  const token = `sess_${uuidv4()}`;
-  await AuthSession.create({ _id: uuidv4(), user_id: userId, token, type: 'session', mfa_verified: 1, voice_verified: 0, expires_at: new Date(Date.now() + 8 * 60 * 60 * 1000).toISOString(), created_at: nowIso() });
-  return token;
-}
-
-async function getSession(token) {
-  if (!token) return null;
-  const session = await AuthSession.findOne({ token, expires_at: { $gt: nowIso() } }).lean();
-  if (!session) return null;
-  const user = await User.findById(session.user_id).lean();
-  if (!user) return null;
-  return { ...session, id: session._id, username: user.username, display_name: user.display_name, role: user.role, email: user.email, mobile: user.mobile, captain_vehicle: user.captain_vehicle, profile_image: user.profile_image };
-}
-
-async function requireSession(req, res, next) {
-  const token = req.headers['x-session-token'] || req.query.sessionToken;
-  const session = await getSession(token);
-  if (!session || session.type !== 'session') return res.status(401).json({ error: 'Valid session token required.' });
-  req.session = session;
-  return next();
-}
-
-async function sendEmailOtp(email, otp) {
-  if (gmailTransporter && gmailFromEmail) {
-    await gmailTransporter.sendMail({ from: gmailFromEmail, to: email, subject: 'Your RouteX OTP', text: `Your OTP is ${otp}. Valid for 10 minutes.`, html: `<p>Your OTP is <strong>${otp}</strong>. Valid for 10 minutes.</p>` });
-    return;
-  }
-  if (sendgridApiKey && sendgridFromEmail) {
-    await sgMail.send({ to: email, from: sendgridFromEmail, subject: 'Your RouteX OTP', text: `Your OTP is ${otp}. Valid for 10 minutes.` });
-    return;
-  }
-  if (!otpDebugMode) throw new Error('No email provider configured.');
-  console.log(`[DEV OTP] ${email}: ${otp}`);
-}
-
-// ============================================================================
-// EXPRESS APP
-// ============================================================================
-
-const app = express();
-
-const allowedOrigins = [
-  'http://localhost:4200',
-  'https://enterprise-lunchbox-lms-prod.vercel.app',
-  'https://ekart-backend-buwi.onrender.com',
-  'capacitor://localhost',
-  'http://localhost'
-];
-
-app.use(cors({
-  origin(origin, cb) { if (!origin || allowedOrigins.includes(origin)) cb(null, true); else cb(new Error('CORS not allowed')); },
-  methods: ['GET','POST','PUT','PATCH','DELETE','OPTIONS'],
-  allowedHeaders: ['Content-Type','Authorization','x-session-token'],
-  optionsSuccessStatus: 204
-}));
-app.options('*', cors());
-app.use(morgan('dev'));
-app.use(express.json({ limit: '25mb' }));
-app.use(express.urlencoded({ extended: true, limit: '25mb' }));
-
-// ============================================================================
-// ROUTES
-// ============================================================================
-
-app.get('/', (_req, res) => res.json({ service: 'routex-backend', status: 'ok', version: '1.0.0' }));
-
-app.get('/health', (_req, res) => {
-  const mongoOk = mongoose.connection.readyState === 1;
-  res.json({ service: 'routex-backend', status: mongoOk ? 'ok' : 'degraded', database: mongoOk ? 'connected' : 'disconnected', timestamp: nowIso() });
-});
-
-// ── AUTH ──────────────────────────────────────────────────────────────────────
-
-app.post('/api/auth/register', async (req, res) => {
-  try {
-    const { username, displayName, email, mobile, password, role, captainVehicle, profileImageUrl } = req.body || {};
-    if (!username || !displayName || !email || !mobile || !password || !role) return res.status(400).json({ error: 'All fields are required.' });
-    const normalizedRole = String(role).trim().toLowerCase();
-    if (!['customer','admin','captain'].includes(normalizedRole)) return res.status(400).json({ error: 'Invalid role.' });
-    if (normalizedRole === 'captain' && !captainVehicle) return res.status(400).json({ error: 'captainVehicle is required for captains.' });
-    const exists = await User.findOne({ $or: [{ username: username.trim().toLowerCase() }, { email: email.trim().toLowerCase() }] });
-    if (exists) return res.status(409).json({ error: 'User already exists.' });
-    const userId = uuidv4();
-    await User.create({
-      _id: userId, username: username.trim().toLowerCase(), display_name: displayName.trim(),
-      email: email.trim().toLowerCase(), mobile: mobile.trim(),
-      password: bcrypt.hashSync(password, 10), role: normalizedRole,
-      captain_vehicle: normalizedRole === 'captain' ? String(captainVehicle).trim() : null,
-      profile_image: profileImageUrl || null,
-      customer_otp_completed: normalizedRole === 'customer' ? 0 : 1,
-      created_at: nowIso(), updated_at: nowIso()
-    });
-    if (normalizedRole !== 'customer') return res.status(201).json({ message: 'Registered successfully.' });
-    const tempToken = await issueTempToken(userId);
-    const emailOtp = genOtp();
-    await OtpCode.create({ _id: uuidv4(), user_id: userId, session_token: tempToken, channel: 'email', code: emailOtp, consumed: 0, expires_at: new Date(Date.now() + 10 * 60 * 1000).toISOString(), created_at: nowIso() });
-    try { await sendEmailOtp(email.trim().toLowerCase(), emailOtp); } catch (e) {
-      await User.deleteOne({ _id: userId });
-      return res.status(502).json({ error: 'Could not send OTP email.' });
+    // BroadcastChannel: instant cross-tab real-time (customer → captain on same browser/device)
+    if (typeof window !== 'undefined' && 'BroadcastChannel' in window) {
+      this.broadcastChannel = new BroadcastChannel(BROADCAST_CHANNEL_NAME);
+      this.broadcastChannel.onmessage = (event) => {
+        if (event.data?.type === 'NEW_BOOKING' && event.data?.booking) {
+          this.upsertBooking(event.data.booking as Booking);
+        }
+        if (event.data?.type === 'BOOKINGS_UPDATED') {
+          const latest = this.loadBookings();
+          this.bookingsSubject.next(latest);
+        }
+      };
     }
-    const payload = { message: 'OTP sent to email. Verify to complete registration.', requiresOtp: true, tempToken, channels: { email: email.trim().toLowerCase() } };
-    if (otpDebugMode) payload.devOtps = { emailOtp };
-    return res.status(201).json(payload);
-  } catch (err) { console.error('Register error', err); return res.status(500).json({ error: 'Registration failed.' }); }
-});
 
-app.post('/api/auth/login', async (req, res) => {
-  try {
-    const { username, password, role } = req.body || {};
-    const user = await User.findOne({ username: (username || '').trim().toLowerCase() }).lean();
-    if (!user || !bcrypt.compareSync(String(password || ''), String(user.password || ''))) return res.status(401).json({ error: 'Invalid username or password.' });
-    const requestedRole = String(role || '').trim().toLowerCase();
-    if (requestedRole && requestedRole !== String(user.role || '').toLowerCase()) return res.status(401).json({ error: 'Selected login mode does not match your account role.' });
-    if (user.role === 'customer' && Number(user.customer_otp_completed) !== 1) return res.status(403).json({ error: 'Complete OTP verification first.' });
-    const sessionToken = await issueSessionToken(user._id);
-    return res.json({
-      requiresOtp: false, tempToken: '', sessionToken,
-      user: { id: user._id, username: user.username, displayName: user.display_name, role: user.role, email: user.email, mobile: user.mobile, captainVehicle: user.captain_vehicle || undefined, profileImageUrl: user.profile_image || undefined },
-      message: 'Login successful.', channels: { email: user.email, mobile: user.mobile }
+    interval(6000).subscribe(() => this.tickBookings());
+
+    if (typeof window !== 'undefined') {
+      fromEvent<StorageEvent>(window, 'storage').subscribe((event) => {
+        if (event.key !== STORAGE_KEY) {
+          return;
+        }
+
+        const latest = this.loadBookings();
+        this.bookingsSubject.next(latest);
+      });
+    }
+
+    this.auth.user$.pipe(
+      distinctUntilChanged((prev, curr) => (prev?.id ?? null) === (curr?.id ?? null))
+    ).subscribe((user) => {
+      if (!user) {
+        this.persist([]);
+        this.disconnectSse();
+        return;
+      }
+
+      this.syncBookingsFromServer(true);
+      // Connect SSE for real-time cross-device push (captains receive instant notifications)
+      this.connectSse();
     });
-  } catch (err) { console.error('Login error', err); return res.status(500).json({ error: 'Login failed.' }); }
-});
 
-app.post('/api/auth/verify-otp', async (req, res) => {
-  try {
-    const { tempToken, emailOtp } = req.body || {};
-    const session = await getSession(tempToken);
-    if (!session || session.type !== 'temp') return res.status(401).json({ error: 'Invalid or expired temp token.' });
-    const code = await OtpCode.findOne({ session_token: tempToken, channel: 'email', consumed: 0, expires_at: { $gt: nowIso() } }).lean();
-    if (!code || code.code !== String(emailOtp || '').trim()) return res.status(400).json({ error: 'Invalid or expired OTP.' });
-    await OtpCode.updateMany({ session_token: tempToken }, { $set: { consumed: 1 } });
-    await User.updateOne({ _id: session.user_id }, { $set: { customer_otp_completed: 1 } });
-    const sessionToken = await issueSessionToken(session.user_id);
-    const user = await User.findById(session.user_id).lean();
-    return res.json({ sessionToken, user: { id: user._id, username: user.username, displayName: user.display_name, role: user.role, email: user.email, mobile: user.mobile, captainVehicle: user.captain_vehicle || undefined }, message: 'Verified successfully!' });
-  } catch (err) { console.error('Verify OTP error', err); return res.status(500).json({ error: 'OTP verification failed.' }); }
-});
+    // Fallback polling every 5s (SSE handles real-time; polling catches missed events)
+    interval(5000)
+      .pipe(switchMap(() => this.fetchBookingsFromServer()))
+      .subscribe((bookings) => {
+        if (!bookings) {
+          return;
+        }
+        this.persist(this.mergeServerWithLocal(bookings));
+      });
+  }
 
-app.post('/api/auth/logout', requireSession, async (req, res) => {
-  await AuthSession.deleteOne({ token: req.session.token });
-  return res.json({ message: 'Logged out successfully.' });
-});
+  createBooking(userId: string, userName: string, request: BookingRequest): Booking {
+    const sessionUser = this.auth.getCurrentUser();
+    const normalizedUserId = sessionUser?.id || userId;
+    const normalizedUserName = sessionUser?.displayName || userName;
+    const now = new Date().toISOString();
+    const scheduledAt = request.scheduledAt ? new Date(request.scheduledAt).toISOString() : undefined;
+    const isScheduled = !!scheduledAt && new Date(scheduledAt).getTime() > Date.now();
+    const otp = `${Math.floor(100000 + Math.random() * 900000)}`;
+    const booking: Booking = {
+      id: `RouteX-BK-${Date.now().toString().slice(-8)}`,
+      userId: normalizedUserId,
+      userName: normalizedUserName,
+      bookingFor: request.bookingFor,
+      recipientName: request.recipientName,
+      recipientPhone: request.recipientPhone,
+      isScheduled,
+      scheduledAt,
+      serviceType: request.serviceType,
+      paymentMethod: request.paymentMethod,
+      vehicleType: request.vehicleType,
+      pickup: request.pickup,
+      drop: request.drop,
+      currentLocation: { ...request.pickup },
+      status: 'created',
+      otp,
+      otpVerified: false,
+      driverName: request.captainName || 'Ravi Kumar',
+      driverPhone: request.captainPhone || '+91-90000-12345',
+      captainId: request.captainId,
+      notificationTarget: request.notificationTarget || 'all',  // default broadcast to ALL captains
+      preferredCaptainId: request.preferredCaptainId,
+      preferredCaptainName: request.preferredCaptainName,
+      notification: isScheduled
+        ? `Booking scheduled for ${new Date(scheduledAt as string).toLocaleString()}. OTP ${otp} will be used to start ride.`
+        : request.serviceType === 'food'
+          ? 'Your order is placed. Waiting for captain/restaurant acceptance.'
+          : request.notificationTarget === 'all'
+            ? `Booking confirmed. OTP ${otp} generated. Broadcast notification sent to all captains.`
+            : `Booking confirmed. OTP ${otp} generated. Preferred captain will be notified.`,
+      estimatedFare: request.estimatedFare,
+      rideNotes: request.rideNotes,
+      pickupServiceMode: request.pickupServiceMode,
+      pickupShopName: request.pickupShopName,
+      pickupShopPhone: request.pickupShopPhone,
+      pickupItemDetails: request.pickupItemDetails,
+      pickupShopInstructions: request.pickupShopInstructions,
+      pickupItemGridSelection: request.pickupItemGridSelection,
+      createdAt: now,
+      updatedAt: now
+    };
 
-app.get('/api/auth/me', requireSession, (req, res) => {
-  return res.json({ id: req.session.user_id, username: req.session.username, displayName: req.session.display_name, role: req.session.role, email: req.session.email, mobile: req.session.mobile, captainVehicle: req.session.captain_vehicle || undefined, profileImageUrl: req.session.profile_image || undefined });
-});
+    const updated = [booking, ...this.bookingsSubject.value];
+    this.persist(updated);
 
-app.post('/api/auth/profile-image', requireSession, async (req, res) => {
-  const { profileImageUrl } = req.body || {};
-  if (!profileImageUrl) return res.status(400).json({ error: 'profileImageUrl is required.' });
-  await User.updateOne({ _id: req.session.user_id }, { $set: { profile_image: String(profileImageUrl).trim() } });
-  return res.json({ message: 'Profile image updated successfully.', profileImageUrl: String(profileImageUrl).trim() });
-});
+    // ── INSTANT cross-tab broadcast (captain on same browser gets it immediately, zero delay) ──
+    this.broadcastChannel?.postMessage({ type: 'NEW_BOOKING', booking });
 
-app.delete('/api/auth/account', requireSession, async (req, res) => {
-  await Promise.all([User.deleteOne({ _id: req.session.user_id }), AuthSession.deleteMany({ user_id: req.session.user_id }), OtpCode.deleteMany({ user_id: req.session.user_id })]);
-  return res.json({ message: 'Account deleted successfully.' });
-});
+    // ── POST to server with auto-retry (up to 5 attempts, 3s apart) so captain on other devices gets it ──
+    this.http
+      .post<Booking>(BOOKINGS_API, request, { headers: this.getSessionHeaders() })
+      .pipe(retry({ count: 5, delay: 3000 }))
+      .subscribe({
+        next: (serverBooking) => {
+          this.upsertBooking(serverBooking);
+          // Broadcast updated list after server confirms so all captain tabs refresh
+          this.broadcastChannel?.postMessage({ type: 'BOOKINGS_UPDATED' });
+        },
+        error: () => {
+          // After 5 retries still failed — silently ignore, local booking is safe
+        }
+      });
 
-app.post('/api/auth/user-action', requireSession, async (req, res) => {
-  const { actionType, metadata } = req.body || {};
-  if (!actionType) return res.status(400).json({ error: 'actionType is required.' });
-  await UserAction.create({ _id: uuidv4(), user_id: req.session.user_id, action_type: actionType, metadata_json: JSON.stringify(metadata || {}), created_at: nowIso() });
-  return res.json({ message: 'Action recorded.' });
-});
+    if (isScheduled) {
+      this.notifications.push(
+        `Booking ${booking.id} scheduled for ${new Date(scheduledAt as string).toLocaleString()}.`,
+        'info'
+      );
+    } else if (request.serviceType === 'food') {
+      this.notifications.push(
+        `Order ${booking.id} placed. Once captain/restaurant accepts, your order will be confirmed in about 2 minutes.`,
+        'success'
+      );
+    } else {
+      this.notifications.push(
+        `Booking ${booking.id} created. OTP: ${booking.otp}. Enter this in tracking screen to start ride.`,
+        'success'
+      );
+    }
 
-app.get('/api/auth/actions', requireSession, async (req, res) => {
-  const isAdmin = req.session.role === 'admin';
-  const query = isAdmin ? {} : { user_id: req.session.user_id };
-  const rows = await UserAction.find(query).sort({ created_at: -1 }).limit(100).lean();
-  return res.json(rows.map(r => ({ actionType: r.action_type, metadata: safeJson(r.metadata_json, {}), createdAt: r.created_at, userId: r.user_id })));
-});
+    return booking;
+  }
 
-app.get('/api/auth/captains', requireSession, async (req, res) => {
-  const { vehicleType } = req.query;
-  const query = vehicleType ? { role: 'captain', captain_vehicle: String(vehicleType) } : { role: 'captain' };
-  const captains = await User.find(query).select('_id username display_name mobile captain_vehicle profile_image').lean();
-  return res.json(captains.map(c => ({ id: c._id, username: c.username, displayName: c.display_name, phone: c.mobile, vehicleType: c.captain_vehicle || undefined, profileImageUrl: c.profile_image || undefined, availability: 'available' })));
-});
+  verifyOtp(bookingId: string, otp: string): { success: boolean; message: string } {
+    const bookings = [...this.bookingsSubject.value];
+    const index = bookings.findIndex((booking) => booking.id === bookingId);
 
-app.get('/api/auth/users', requireSession, async (req, res) => {
-  if (req.session.role !== 'admin') return res.status(403).json({ error: 'Admin role required.' });
-  const users = await User.find({}).select('_id username display_name email mobile role captain_vehicle created_at').sort({ created_at: -1 }).lean();
-  return res.json(users.map(u => ({ id: u._id, username: u.username, displayName: u.display_name, email: u.email, mobile: u.mobile, role: u.role, captainVehicle: u.captain_vehicle || undefined, createdAt: u.created_at })));
-});
+    if (index === -1) {
+      return { success: false, message: 'Booking not found.' };
+    }
 
-app.get('/api/auth/users/stats', requireSession, async (req, res) => {
-  if (req.session.role !== 'admin') return res.status(403).json({ error: 'Admin role required.' });
-  const [total, customers, captains, admins] = await Promise.all([User.countDocuments(), User.countDocuments({ role: 'customer' }), User.countDocuments({ role: 'captain' }), User.countDocuments({ role: 'admin' })]);
-  return res.json({ totalUsers: total, totalCustomers: customers, totalCaptains: captains, totalAdmins: admins });
-});
+    if (bookings[index].otp !== otp.trim()) {
+      return { success: false, message: 'Invalid OTP.' };
+    }
 
-app.post('/api/auth/captain-feedback', requireSession, async (req, res) => {
-  const { bookingId, captainId, captainName, rideRating, captainRating, feedbackText, lovedRide, lovedCaptain } = req.body || {};
-  if (!bookingId || !captainName || !rideRating || !captainRating) return res.status(400).json({ error: 'bookingId, captainName, rideRating, captainRating are required.' });
-  const now = nowIso();
-  const existing = await CaptainFeedback.findOne({ booking_id: String(bookingId) });
-  const data = { captain_user_id: captainId || null, captain_name: String(captainName).trim(), submitted_by_user_id: req.session.user_id, submitted_by_name: req.session.display_name || req.session.username, ride_rating: Number(rideRating), captain_rating: Number(captainRating), feedback_text: feedbackText || null, loved_ride: lovedRide ? 1 : 0, loved_captain: lovedCaptain ? 1 : 0, updated_at: now };
-  if (existing) { await CaptainFeedback.updateOne({ booking_id: String(bookingId) }, { $set: data }); }
-  else { await CaptainFeedback.create({ _id: uuidv4(), booking_id: String(bookingId), ...data, created_at: now }); }
-  return res.json({ message: 'Feedback submitted.' });
-});
+    bookings[index] = {
+      ...bookings[index],
+      otpVerified: true,
+      status: 'assigned',
+      notification: 'Ride started. Customer OTP verified successfully. Captain is on the way.',
+      updatedAt: new Date().toISOString()
+    };
 
-app.get('/api/auth/captain-feedback/stats', requireSession, async (req, res) => {
-  if (!['captain','admin'].includes(req.session.role)) return res.status(403).json({ error: 'Captain or admin role required.' });
-  const captainUserId = req.session.role === 'admin' ? (req.query.captainId || '') : req.session.user_id;
-  const allFeedback = await CaptainFeedback.find({ captain_user_id: captainUserId }).lean();
-  const feedbackCount = allFeedback.length;
-  const avgCaptainRating = feedbackCount ? Number((allFeedback.reduce((s,f) => s + Number(f.captain_rating||0), 0) / feedbackCount).toFixed(1)) : 0;
-  const avgRideRating = feedbackCount ? Number((allFeedback.reduce((s,f) => s + Number(f.ride_rating||0), 0) / feedbackCount).toFixed(1)) : 0;
-  const totalHearts = allFeedback.reduce((s,f) => s + Number(f.loved_captain||0) + Number(f.loved_ride||0), 0);
-  const recentComments = await CaptainFeedback.find({ captain_user_id: captainUserId, feedback_text: { $nin: [null,''] } }).sort({ created_at: -1 }).limit(8).lean();
-  return res.json({ feedbackCount, avgCaptainRating, avgRideRating, totalHearts, recentComments: recentComments.map(r => ({ bookingId: r.booking_id, userName: r.submitted_by_name, rideRating: r.ride_rating, captainRating: r.captain_rating, feedbackText: r.feedback_text, lovedRide: toBool(r.loved_ride), lovedCaptain: toBool(r.loved_captain), createdAt: r.created_at })) });
-});
+    this.persist(bookings);
+    this.http
+      .post<Booking>(`${BOOKINGS_API}/${bookingId}/verify-otp`, { otp }, { headers: this.getSessionHeaders() })
+      .subscribe({ next: (serverBooking) => this.upsertBooking(serverBooking), error: () => void 0 });
+    this.notifications.push(`OTP verified for ${bookingId}. Ride started for customer.`, 'success');
+    this.notifications.push('Customer notification: Your ride has started.', 'info');
+    return { success: true, message: 'OTP verified. Ride started successfully.' };
+  }
 
-app.post('/api/auth/voice-challenge', requireSession, async (_req, res) => {
-  const phrases = ['confirm secure delivery now', 'my parcel is ready to drop', 'verify identity for delivery'];
-  return res.json({ phrase: phrases[Math.floor(Math.random() * phrases.length)], expiresAt: new Date(Date.now() + 4 * 60 * 1000).toISOString() });
-});
+  approveByCaptain(bookingId: string): { success: boolean; message: string } {
+    const bookings = [...this.bookingsSubject.value];
+    const index = bookings.findIndex((booking) => booking.id === bookingId);
 
-app.post('/api/auth/voice-verify', requireSession, async (_req, res) => {
-  return res.json({ message: 'Voice verified successfully.' });
-});
+    if (index === -1) {
+      return { success: false, message: 'Booking not found.' };
+    }
 
-// ── BOOKINGS ─────────────────────────────────────────────────────────────────
+    if (bookings[index].status !== 'created') {
+      return { success: false, message: 'Captain approval is only available before ride start.' };
+    }
 
-app.get('/api/bookings', requireSession, async (req, res) => {
-  try {
-    const includeCompleted = String(req.query.includeCompleted || '').toLowerCase() === 'true';
-    const maxItems = Math.min(500, Number(req.query.limit || 200));
-    const allRows = await Booking.find({}).sort({ updated_at: -1 }).limit(maxItems).lean();
-    // canAccessBooking: admin=all, customer=own, captain=notificationTarget='all' OR assigned
-    const visible = allRows.filter(row => canAccessBooking(req.session, row));
-    const filtered = visible.filter(row => {
-      if (!includeCompleted && row.status !== 'completed' && row.status !== 'cancelled') return true;
-      if (!includeCompleted && (row.status === 'completed' || row.status === 'cancelled')) return false;
-      return true;
+    bookings[index] = {
+      ...bookings[index],
+      status: 'assigned',
+      notification: 'Ride started. Captain approved the trip and is on the way.',
+      updatedAt: new Date().toISOString()
+    };
+
+    this.persist(bookings);
+    this.http
+      .post<Booking>(`${BOOKINGS_API}/${bookingId}/approve`, {}, { headers: this.getSessionHeaders() })
+      .subscribe({ next: (serverBooking) => this.upsertBooking(serverBooking), error: () => void 0 });
+    this.notifications.push(`Captain approved ride start for ${bookingId}.`, 'success');
+    return { success: true, message: 'Captain approved and ride started successfully.' };
+  }
+
+  cancelRide(bookingId: string, role: 'customer' | 'captain'): { success: boolean; message: string } {
+    const bookings = [...this.bookingsSubject.value];
+    const index = bookings.findIndex((booking) => booking.id === bookingId);
+
+    if (index === -1) {
+      return { success: false, message: 'Booking not found.' };
+    }
+
+    if (bookings[index].status === 'completed' || bookings[index].status === 'cancelled') {
+      return { success: false, message: 'This ride can no longer be cancelled.' };
+    }
+
+    bookings[index] = {
+      ...bookings[index],
+      status: 'cancelled',
+      notification: `Ride cancelled by ${role}.`,
+      updatedAt: new Date().toISOString()
+    };
+
+    this.persist(bookings);
+    this.http
+      .post<Booking>(`${BOOKINGS_API}/${bookingId}/cancel`, { role }, { headers: this.getSessionHeaders() })
+      .subscribe({ next: (serverBooking) => this.upsertBooking(serverBooking), error: () => void 0 });
+    this.notifications.push(`Ride ${bookingId} cancelled by ${role}.`, 'warning');
+    return { success: true, message: 'Ride cancelled successfully.' };
+  }
+
+  getBookingById$(bookingId: string): Observable<Booking | undefined> {
+    return this.bookings$.pipe(map((bookings) => bookings.find((booking) => booking.id === bookingId)));
+  }
+
+  getBookingsForUser$(userId: string): Observable<Booking[]> {
+    return this.bookings$.pipe(map((bookings) => bookings.filter((booking) => booking.userId === userId)));
+  }
+
+  getAllBookingsSnapshot(): Booking[] {
+    return [...this.bookingsSubject.value];
+  }
+
+  buildRebookRequest(booking: Booking): BookingRequest {
+    return {
+      bookingFor: booking.bookingFor,
+      recipientName: booking.recipientName,
+      recipientPhone: booking.recipientPhone,
+      serviceType: booking.serviceType,
+      paymentMethod: booking.paymentMethod,
+      vehicleType: booking.vehicleType,
+      pickup: { ...booking.pickup },
+      drop: { ...booking.drop },
+      captainId: booking.captainId,
+      captainName: booking.driverName,
+      captainPhone: booking.driverPhone,
+      notificationTarget: booking.notificationTarget,
+      preferredCaptainId: booking.preferredCaptainId,
+      preferredCaptainName: booking.preferredCaptainName,
+      estimatedFare: booking.estimatedFare,
+      rideNotes: booking.rideNotes,
+      pickupServiceMode: booking.pickupServiceMode,
+      pickupShopName: booking.pickupShopName,
+      pickupShopPhone: booking.pickupShopPhone,
+      pickupItemDetails: booking.pickupItemDetails,
+      pickupShopInstructions: booking.pickupShopInstructions,
+      pickupItemGridSelection: booking.pickupItemGridSelection
+    };
+  }
+
+  triggerSos(bookingId: string, role: 'customer' | 'captain'): { success: boolean; message: string } {
+    const bookings = [...this.bookingsSubject.value];
+    const index = bookings.findIndex((booking) => booking.id === bookingId);
+
+    if (index === -1) {
+      return { success: false, message: 'Booking not found for SOS.' };
+    }
+
+    bookings[index] = {
+      ...bookings[index],
+      sosTriggered: true,
+      sosByRole: role,
+      notification: `SOS triggered by ${role}. Emergency support alerted and captain/customer informed.`,
+      updatedAt: new Date().toISOString()
+    };
+
+    this.persist(bookings);
+    this.http
+      .post<Booking>(`${BOOKINGS_API}/${bookingId}/sos`, { role }, { headers: this.getSessionHeaders() })
+      .subscribe({ next: (serverBooking) => this.upsertBooking(serverBooking), error: () => void 0 });
+    this.notifications.push(`SOS alert sent for ${bookingId}.`, 'warning');
+    return { success: true, message: 'SOS alert sent successfully.' };
+  }
+
+  submitRideFeedback(
+    bookingId: string,
+    payload: {
+      rideRating: number;
+      captainRating: number;
+      feedbackText?: string;
+      lovedRide: boolean;
+      lovedCaptain: boolean;
+    }
+  ): { success: boolean; message: string } {
+    const bookings = [...this.bookingsSubject.value];
+    const index = bookings.findIndex((booking) => booking.id === bookingId);
+
+    if (index === -1) {
+      return { success: false, message: 'Booking not found for feedback.' };
+    }
+
+    if (bookings[index].status !== 'completed') {
+      return { success: false, message: 'Feedback is available only after ride completion.' };
+    }
+
+    bookings[index] = {
+      ...bookings[index],
+      feedbackSubmitted: true,
+      feedbackSubmittedAt: new Date().toISOString(),
+      rideRating: payload.rideRating,
+      captainRating: payload.captainRating,
+      feedbackText: (payload.feedbackText || '').trim() || undefined,
+      lovedRide: payload.lovedRide,
+      lovedCaptain: payload.lovedCaptain,
+      notification: 'Thank you! Customer feedback and ratings submitted successfully.',
+      updatedAt: new Date().toISOString()
+    };
+
+    this.persist(bookings);
+    this.http
+      .post<Booking>(`${BOOKINGS_API}/${bookingId}/feedback`, payload, { headers: this.getSessionHeaders() })
+      .subscribe({ next: (serverBooking) => this.upsertBooking(serverBooking), error: () => void 0 });
+    this.notifications.push('Feedback submitted. Thanks for rating this ride and captain.', 'success');
+    return { success: true, message: 'Feedback submitted successfully.' };
+  }
+
+  markPaymentDone(bookingId: string, amount: number): { success: boolean; message: string } {
+    const bookings = [...this.bookingsSubject.value];
+    const index = bookings.findIndex((booking) => booking.id === bookingId);
+
+    if (index === -1) {
+      return { success: false, message: 'Booking not found for payment.' };
+    }
+
+    if (bookings[index].status !== 'completed') {
+      return { success: false, message: 'Payment can be completed only after ride completion.' };
+    }
+
+    const finalAmount = Number(amount || bookings[index].estimatedFare || 0);
+    bookings[index] = {
+      ...bookings[index],
+      finalAmount,
+      paymentDone: true,
+      paymentDoneAt: new Date().toISOString(),
+      notification: `Payment completed by customer: Rs ${finalAmount}. Captain has been notified. Please submit feedback to close tracking.`,
+      updatedAt: new Date().toISOString()
+    };
+
+    this.persist(bookings);
+    this.http
+      .post<Booking>(`${BOOKINGS_API}/${bookingId}/pay`, { amount: finalAmount }, { headers: this.getSessionHeaders() })
+      .subscribe({ next: (serverBooking) => this.upsertBooking(serverBooking), error: () => void 0 });
+    return { success: true, message: `Payment completed: Rs ${finalAmount}.` };
+  }
+
+  closeTracking(bookingId: string): { success: boolean; message: string } {
+    const bookings = [...this.bookingsSubject.value];
+    const index = bookings.findIndex((booking) => booking.id === bookingId);
+
+    if (index === -1) {
+      return { success: false, message: 'Booking not found for closing tracking.' };
+    }
+
+    if (!bookings[index].feedbackSubmitted) {
+      return { success: false, message: 'Please submit feedback before closing tracking.' };
+    }
+
+    bookings[index] = {
+      ...bookings[index],
+      trackingClosed: true,
+      trackingClosedAt: new Date().toISOString(),
+      notification: 'Tracking closed. Trip moved to booking history.',
+      updatedAt: new Date().toISOString()
+    };
+
+    this.persist(bookings);
+    this.http
+      .post<Booking>(`${BOOKINGS_API}/${bookingId}/close-tracking`, {}, { headers: this.getSessionHeaders() })
+      .subscribe({ next: (serverBooking) => this.upsertBooking(serverBooking), error: () => void 0 });
+
+    return { success: true, message: 'Tracking closed and moved to history.' };
+  }
+
+  private tickBookings(): void {
+    const before = this.bookingsSubject.value;
+    const changed = before.map((booking) => this.progressBooking(booking));
+    this.persist(changed, false);
+
+    // Sync any locally auto-cancelled bookings to the server so the server
+    // does not restore them on the next poll and trigger the notification loop.
+    changed.forEach((booking, index) => {
+      const previous = before[index];
+      if (booking.status === 'cancelled' && previous.status !== 'cancelled') {
+        this.http
+          .post<Booking>(`${BOOKINGS_API}/${booking.id}/cancel`, { role: 'system' }, { headers: this.getSessionHeaders() })
+          .subscribe({ next: (serverBooking) => this.upsertBooking(serverBooking), error: () => void 0 });
+      }
     });
-    return res.json(filtered.map(mapBookingRow));
-  } catch (err) { console.error('GET /api/bookings error', err); return res.status(500).json({ error: 'Failed to fetch bookings.' }); }
-});
+  }
 
-app.get('/api/bookings/:bookingId', requireSession, async (req, res) => {
-  const booking = await Booking.findById(req.params.bookingId).lean();
-  if (!booking) return res.status(404).json({ error: 'Booking not found.' });
-  if (!canAccessBooking(req.session, booking)) return res.status(403).json({ error: 'Access denied.' });
-  return res.json(mapBookingRow(booking));
-});
+  private syncBookingsFromServer(forceNotify: boolean = false): void {
+    this.fetchBookingsFromServer().subscribe((serverBookings) => {
+      if (!serverBookings) {
+        return;
+      }
 
-app.post('/api/bookings', requireSession, async (req, res) => {
-  try {
-    const body = req.body || {};
-    const now = nowIso();
-    const pickup = body.pickup || {};
-    const drop = body.drop || {};
-    if (!pickup.address || !drop.address) return res.status(400).json({ error: 'pickup and drop addresses are required.' });
-    const otp = genOtp();
-    const bookingId = `BK-${Date.now().toString().slice(-8)}`;
-    const notificationTarget = body.notificationTarget || 'all';   // ← DEFAULT 'all'
-    await Booking.create({
-      _id: bookingId,
-      user_id: req.session.user_id,
-      user_name: req.session.display_name || req.session.username || 'Customer',
-      booking_for: body.bookingFor || 'self',
-      recipient_name: body.recipientName || null, recipient_phone: body.recipientPhone || null,
-      is_scheduled: 0, scheduled_at: body.scheduledAt || null,
-      service_type: body.serviceType || 'parcel',
-      payment_method: body.paymentMethod || 'cash',
-      vehicle_type: body.vehicleType || 'bike',
-      pickup_json: JSON.stringify({ address: String(pickup.address), lat: Number(pickup.lat||0), lng: Number(pickup.lng||0) }),
-      drop_json: JSON.stringify({ address: String(drop.address), lat: Number(drop.lat||0), lng: Number(drop.lng||0) }),
-      current_location_json: JSON.stringify({ address: String(pickup.address), lat: Number(pickup.lat||0), lng: Number(pickup.lng||0) }),
-      status: 'created',   // ← 'created' so captain alert fires
-      otp, otp_verified: 0,
-      driver_name: body.captainName || 'Ravi Kumar',
-      driver_phone: body.captainPhone || '+91-90000-12345',
-      captain_id: body.captainId || null,
-      notification_target: notificationTarget,  // ← 'all' = every captain receives alert
-      preferred_captain_id: body.preferredCaptainId || null,
-      preferred_captain_name: body.preferredCaptainName || null,
-      notification: notificationTarget === 'all' ? `Booking confirmed. OTP ${otp}. Broadcast to all captains.` : `Booking confirmed. OTP ${otp}. Preferred captain notified.`,
-      estimated_fare: body.estimatedFare != null ? Number(body.estimatedFare) : null,
-      ride_notes: body.rideNotes || null,
-      sos_triggered: 0, sos_by_role: null, feedback_submitted: 0, feedback_submitted_at: null,
-      feedback_text: null, ride_rating: null, captain_rating: null,
-      loved_ride: 0, loved_captain: 0, final_amount: null, payment_done: 0, payment_done_at: null,
-      tracking_closed: 0, tracking_closed_at: null,
-      created_at: now, updated_at: now
+      this.persist(this.mergeServerWithLocal(serverBookings));
+      if (forceNotify) {
+        this.notifications.push('Live ride sync connected to backend.', 'info');
+      }
     });
-    const created = await Booking.findById(bookingId).lean();
-    return res.status(201).json(mapBookingRow(created));
-  } catch (err) { console.error('POST /api/bookings error', err); return res.status(500).json({ error: 'Failed to create booking.' }); }
-});
+  }
 
-app.post('/api/bookings/:bookingId/approve', requireSession, async (req, res) => {
-  const booking = await Booking.findById(req.params.bookingId).lean();
-  if (!booking) return res.status(404).json({ error: 'Booking not found.' });
-  if (!canAccessBooking(req.session, booking)) return res.status(403).json({ error: 'Access denied.' });
-  if (booking.status !== 'created') return res.status(400).json({ error: 'Booking is no longer available.' });
-  await Booking.updateOne({ _id: booking._id }, { $set: { status: 'assigned', notification: 'Captain accepted the ride and is on the way.', updated_at: nowIso() } });
-  return res.json(mapBookingRow(await Booking.findById(booking._id).lean()));
-});
+  private fetchBookingsFromServer(): Observable<Booking[] | null> {
+    const token = this.auth.getSessionToken();
+    if (!token) {
+      return of(null);
+    }
 
-app.post('/api/bookings/:bookingId/verify-otp', requireSession, async (req, res) => {
-  const { otp } = req.body || {};
-  const booking = await Booking.findById(req.params.bookingId).lean();
-  if (!booking) return res.status(404).json({ error: 'Booking not found.' });
-  if (!canAccessBooking(req.session, booking)) return res.status(403).json({ error: 'Access denied.' });
-  if (String(booking.otp).trim() !== String(otp||'').trim()) return res.status(400).json({ error: 'Invalid OTP.' });
-  await Booking.updateOne({ _id: booking._id }, { $set: { otp_verified: 1, status: 'assigned', notification: 'OTP verified. Ride started.', updated_at: nowIso() } });
-  return res.json(mapBookingRow(await Booking.findById(booking._id).lean()));
-});
+    const includeCompleted = this.auth.isAdmin() || this.auth.getCurrentUser()?.role === 'customer';
+    return this.http.get<Booking[]>(`${BOOKINGS_API}?includeCompleted=${includeCompleted}`, {
+      headers: this.getSessionHeaders()
+    }).pipe(
+      map((items) => Array.isArray(items) ? items : []),
+      catchError(() => of(null))
+    );
+  }
 
-app.post('/api/bookings/:bookingId/cancel', requireSession, async (req, res) => {
-  const booking = await Booking.findById(req.params.bookingId).lean();
-  if (!booking) return res.status(404).json({ error: 'Booking not found.' });
-  if (!canAccessBooking(req.session, booking)) return res.status(403).json({ error: 'Access denied.' });
-  if (['completed','cancelled'].includes(booking.status)) return res.status(400).json({ error: 'Cannot cancel this booking.' });
-  await Booking.updateOne({ _id: booking._id }, { $set: { status: 'cancelled', notification: `Ride cancelled by ${req.body.role || 'user'}.`, updated_at: nowIso() } });
-  return res.json(mapBookingRow(await Booking.findById(booking._id).lean()));
-});
+  private getSessionHeaders(): HttpHeaders {
+    const token = this.auth.getSessionToken();
+    return token ? new HttpHeaders({ 'x-session-token': token }) : new HttpHeaders();
+  }
 
-app.post('/api/bookings/:bookingId/sos', requireSession, async (req, res) => {
-  const booking = await Booking.findById(req.params.bookingId).lean();
-  if (!booking) return res.status(404).json({ error: 'Booking not found.' });
-  await Booking.updateOne({ _id: booking._id }, { $set: { sos_triggered: 1, sos_by_role: req.body.role || 'customer', notification: 'SOS triggered. Emergency help alerted.', updated_at: nowIso() } });
-  return res.json(mapBookingRow(await Booking.findById(booking._id).lean()));
-});
+  private connectSse(): void {
+    this.disconnectSse();
+    const token = this.auth.getSessionToken();
+    if (!token || typeof EventSource === 'undefined') return;
+    const url = `${EVENTS_API}?sessionToken=${encodeURIComponent(token)}`;
+    const es = new EventSource(url);
+    this.eventSource = es;
 
-app.post('/api/bookings/:bookingId/feedback', requireSession, async (req, res) => {
-  const booking = await Booking.findById(req.params.bookingId).lean();
-  if (!booking) return res.status(404).json({ error: 'Booking not found.' });
-  const { rideRating, captainRating, feedbackText, lovedRide, lovedCaptain } = req.body || {};
-  await Booking.updateOne({ _id: booking._id }, { $set: { feedback_submitted: 1, feedback_submitted_at: nowIso(), ride_rating: Number(rideRating||0), captain_rating: Number(captainRating||0), feedback_text: feedbackText || null, loved_ride: lovedRide ? 1 : 0, loved_captain: lovedCaptain ? 1 : 0, notification: 'Feedback submitted. Thank you!', updated_at: nowIso() } });
-  return res.json(mapBookingRow(await Booking.findById(booking._id).lean()));
-});
-
-app.post('/api/bookings/:bookingId/pay', requireSession, async (req, res) => {
-  const booking = await Booking.findById(req.params.bookingId).lean();
-  if (!booking) return res.status(404).json({ error: 'Booking not found.' });
-  const finalAmount = Number(req.body.amount || booking.estimated_fare || 0);
-  await Booking.updateOne({ _id: booking._id }, { $set: { final_amount: finalAmount, payment_done: 1, payment_done_at: nowIso(), notification: `Payment of Rs ${finalAmount} completed.`, updated_at: nowIso() } });
-  return res.json(mapBookingRow(await Booking.findById(booking._id).lean()));
-});
-
-app.post('/api/bookings/:bookingId/close-tracking', requireSession, async (req, res) => {
-  const booking = await Booking.findById(req.params.bookingId).lean();
-  if (!booking) return res.status(404).json({ error: 'Booking not found.' });
-  await Booking.updateOne({ _id: booking._id }, { $set: { tracking_closed: 1, tracking_closed_at: nowIso(), status: 'completed', notification: 'Tracking closed. Trip completed.', updated_at: nowIso() } });
-  return res.json(mapBookingRow(await Booking.findById(booking._id).lean()));
-});
-
-// ── MISC ─────────────────────────────────────────────────────────────────────
-
-app.get('/api/integrations/health', async (_req, res) => {
-  const mongoOk = mongoose.connection.readyState === 1;
-  return res.json({ service: 'routex-backend', status: mongoOk ? 'ok' : 'degraded', checkedAt: nowIso(), integrations: [{ name: 'MongoDB', status: mongoOk ? 'live' : 'down' }, { name: 'Auth API', status: 'live' }, { name: 'Booking API', status: 'live' }] });
-});
-
-app.get('/api/places/nearby-hotels', (_req, res) => {
-  return res.json({ source: 'backend', updatedAt: nowIso(), hotels: [
-    { id: 'h1', name: 'Spice Garden', category: 'nonveg', cuisine: 'Indian', locationLabel: 'City Center', distanceKm: 1.2, etaMinutes: 15, rating: 4.2, openNow: true, priceForTwo: 250 },
-    { id: 'h2', name: 'Pizza Palace', category: 'veg', cuisine: 'Italian', locationLabel: 'MG Road', distanceKm: 0.8, etaMinutes: 10, rating: 4.5, openNow: true, priceForTwo: 400 },
-    { id: 'h3', name: 'Burger Hub', category: 'nonveg', cuisine: 'Fast Food', locationLabel: 'Bus Stand', distanceKm: 2.1, etaMinutes: 20, rating: 4.0, openNow: true, priceForTwo: 300 }
-  ]});
-});
-
-app.get('/api/menu/hotels/:hotelId/items', (req, res) => {
-  const menus = {
-    h1: [{ id:'i1', name:'Special Thali', price:120, description:'Full meal', category:'veg', isTop:true }, { id:'i2', name:'Chicken Curry', price:160, description:'Rich gravy', category:'nonveg', isTop:true }],
-    h2: [{ id:'i5', name:'Margherita Pizza', price:180, description:'Classic', category:'veg', isTop:true }, { id:'i6', name:'Pepperoni Pizza', price:220, description:'Loaded', category:'nonveg', isTop:true }],
-    h3: [{ id:'i8', name:'Classic Burger', price:90, description:'Juicy', category:'nonveg', isTop:true }, { id:'i9', name:'Veg Burger', price:70, description:'Crispy', category:'veg', isTop:true }]
-  };
-  return res.json({ source:'backend', hotelId: req.params.hotelId, updatedAt: nowIso(), items: menus[req.params.hotelId] || menus.h1 });
-});
-
-app.post('/api/pricing/live-fare', async (req, res) => {
-  const { vehicleType } = req.body || {};
-  const rates = { bike:8, auto:12, scooter:10, car:18, van:22, truck:28 };
-  const rate = rates[vehicleType] || 12;
-  return res.json({ distanceKm: 5, durationInTrafficMinutes: 20, trafficCondition: 'medium', weatherCondition: 'clear', breakdown: { baseFare: 55, distanceFare: rate*5, total: 55 + rate*5 } });
-});
-
-app.post('/api/promos/validate', (req, res) => {
-  const catalog = [{ code:'SAVE10', type:'percent', value:10, minAmount:120 }, { code:'FLAT50', type:'flat', value:50, minAmount:250 }, { code:'FIRST100', type:'flat', value:100, minAmount:500 }];
-  const promo = catalog.find(p => p.code === String(req.body.code||'').toUpperCase());
-  if (!promo) return res.status(404).json({ valid: false, error: 'Invalid promo code.' });
-  const amount = Number(req.body.amount || 0);
-  if (amount < promo.minAmount) return res.status(400).json({ valid: false, error: `Minimum Rs ${promo.minAmount} required.` });
-  const discount = promo.type === 'flat' ? promo.value : Math.round(amount * promo.value / 100);
-  return res.json({ valid: true, code: promo.code, discount, payableAmount: Math.max(0, amount - discount) });
-});
-
-app.post('/api/support/complaints', async (req, res) => {
-  const { type, subject, description } = req.body || {};
-  if (!type || !subject || !description) return res.status(400).json({ error: 'type, subject, description required.' });
-  console.log(`[Support] type=${type} subject=${subject}`);
-  return res.status(201).json({ message: 'Complaint submitted successfully.' });
-});
-
-app.post('/api/support/app-feedback', async (req, res) => {
-  console.log('[AppFeedback]', req.body);
-  return res.status(201).json({ message: 'App feedback submitted successfully.' });
-});
-
-// Error handler
-app.use((err, _req, res, _next) => {
-  console.error('Unhandled error', err);
-  res.status(500).json({ error: 'Internal server error.' });
-});
-
-// ============================================================================
-// START
-// ============================================================================
-
-async function start() {
-  try {
-    console.log('Connecting to MongoDB...');
-    await mongoose.connect(mongoUri);
-    console.log('MongoDB connected!');
-    app.listen(port, () => {
-      console.log(`routex-backend listening on :${port}`);
+    es.addEventListener('new_booking', (event: MessageEvent) => {
+      try { this.upsertBooking(JSON.parse(event.data) as Booking); } catch { /* ignore */ }
     });
-  } catch (err) {
-    console.error('Failed to start', err);
-    process.exit(1);
+
+    es.addEventListener('booking_updated', (event: MessageEvent) => {
+      try { this.upsertBooking(JSON.parse(event.data) as Booking); } catch { /* ignore */ }
+    });
+
+    es.onerror = () => {
+      es.close();
+      this.eventSource = null;
+      if (this.auth.getSessionToken()) {
+        this.sseRetryTimer = setTimeout(() => this.connectSse(), 5000);
+      }
+    };
+  }
+
+  private disconnectSse(): void {
+    if (this.sseRetryTimer) { clearTimeout(this.sseRetryTimer); this.sseRetryTimer = null; }
+    if (this.eventSource) { this.eventSource.close(); this.eventSource = null; }
+  }
+
+  private upsertBooking(serverBooking: Booking): void {
+    const existing = [...this.bookingsSubject.value];
+    const idx = existing.findIndex((item) => item.id === serverBooking.id);
+    if (idx >= 0) {
+      existing[idx] = serverBooking;
+      this.persist(existing);
+      return;
+    }
+
+    const localTempIdx = existing.findIndex((item) => this.isLikelyLocalTempMatch(item, serverBooking));
+    if (localTempIdx >= 0) {
+      existing[localTempIdx] = {
+        ...existing[localTempIdx],
+        ...serverBooking
+      };
+      this.persist(existing);
+      return;
+    }
+
+    this.persist([serverBooking, ...existing]);
+  }
+
+  private mergeServerWithLocal(serverBookings: Booking[]): Booking[] {
+    const local = this.bookingsSubject.value;
+    const localById = new Map(local.map((item) => [item.id, item]));
+    const serverIds = new Set(serverBookings.map((item) => item.id));
+
+    // For bookings the server knows about, prefer the server version UNLESS the
+    // local version has a terminal status (cancelled/completed) that is newer than
+    // the server version — this prevents server-sync from undoing a local
+    // auto-cancellation and causing the 20-min popup to fire on every tick.
+    const merged = serverBookings.map((serverItem) => {
+      const localItem = localById.get(serverItem.id);
+      if (!localItem) {
+        return serverItem;
+      }
+
+      const localIsTerminal = localItem.status === 'cancelled' || localItem.status === 'completed';
+      const serverIsNonTerminal = serverItem.status !== 'cancelled' && serverItem.status !== 'completed';
+      const localIsNewer = new Date(localItem.updatedAt).getTime() > new Date(serverItem.updatedAt).getTime();
+
+      if (localIsTerminal && serverIsNonTerminal && localIsNewer) {
+        return localItem;
+      }
+
+      return serverItem;
+    });
+
+    const keepLocal = local.filter((item) => {
+      if (serverIds.has(item.id)) {
+        return false;
+      }
+
+      const recentMinutes = this.minutesSince(item.updatedAt || item.createdAt);
+      const active = item.status !== 'completed' && item.status !== 'cancelled';
+      const localTempId = item.id.startsWith('RouteX-BK-') || item.id.startsWith('BK-');
+
+      return localTempId && active && recentMinutes <= 30;
+    });
+
+    return [...merged, ...keepLocal].sort(
+      (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+    );
+  }
+
+  private isLikelyLocalTempMatch(localBooking: Booking, serverBooking: Booking): boolean {
+    if (!localBooking.id.startsWith('RouteX-BK-') && !localBooking.id.startsWith('BK-')) {
+      return false;
+    }
+
+    const closeInTime = Math.abs(
+      new Date(localBooking.createdAt).getTime() - new Date(serverBooking.createdAt).getTime()
+    ) <= 10 * 60 * 1000;
+
+    return closeInTime &&
+      localBooking.userId === serverBooking.userId &&
+      localBooking.serviceType === serverBooking.serviceType &&
+      localBooking.vehicleType === serverBooking.vehicleType &&
+      localBooking.pickup.address === serverBooking.pickup.address &&
+      localBooking.drop.address === serverBooking.drop.address;
+  }
+
+  private minutesSince(isoTime?: string): number {
+    if (!isoTime) {
+      return Number.POSITIVE_INFINITY;
+    }
+    return (Date.now() - new Date(isoTime).getTime()) / 60000;
+  }
+
+  private progressBooking(booking: Booking): Booking {
+    if (booking.status === 'completed' || booking.status === 'cancelled') {
+      return booking;
+    }
+
+    if (booking.scheduledAt && new Date(booking.scheduledAt).getTime() > Date.now()) {
+      return {
+        ...booking,
+        notification: `Scheduled booking. Ride will start after ${new Date(booking.scheduledAt).toLocaleString()}.`
+      };
+    }
+
+    if (booking.serviceType === 'food' && booking.status === 'created') {
+      if (this.minutesSince(booking.createdAt) >= BookingService.FOOD_CONFIRMATION_DELAY_MINUTES) {
+        if (!this.notifiedBookingIds.has(`food-confirmed-${booking.id}`)) {
+          this.notifiedBookingIds.add(`food-confirmed-${booking.id}`);
+          this.notifications.push(`Order ${booking.id} confirmed by captain/restaurant.`, 'success');
+        }
+        return {
+          ...booking,
+          status: 'assigned',
+          updatedAt: new Date().toISOString(),
+          notification: 'Your order is confirmed by captain/restaurant.'
+        };
+      }
+
+      return {
+        ...booking,
+        notification: 'Your order is placed. Waiting for captain/restaurant acceptance.'
+      };
+    }
+
+    if (booking.status === 'created' && booking.serviceType !== 'food') {
+      if (this.minutesSince(booking.createdAt) >= BookingService.CAPTAIN_ACCEPT_TIMEOUT_MINUTES) {
+        if (!this.notifiedBookingIds.has(`auto-cancel-${booking.id}`)) {
+          this.notifiedBookingIds.add(`auto-cancel-${booking.id}`);
+          this.notifications.push(`Ride ${booking.id} was auto-cancelled because no captain accepted within 20 minutes.`, 'warning');
+        }
+        return {
+          ...booking,
+          status: 'cancelled',
+          updatedAt: new Date().toISOString(),
+          notification: 'Ride auto-cancelled. No captain accepted within 20 minutes.'
+        };
+      }
+    }
+
+    if (!booking.otpVerified && booking.status === 'created') {
+      return {
+        ...booking,
+        notification: 'Waiting for customer OTP verification to start ride.'
+      };
+    }
+
+    const sequence: BookingStatus[] = [
+      'assigned',
+      'pickup_in_progress',
+      'in_transit',
+      'arriving',
+      'delivered',
+      'completed'
+    ];
+
+    const currentIndex = sequence.indexOf(booking.status);
+    let nextStatus: BookingStatus = booking.status;
+
+    if (currentIndex >= 0 && currentIndex < sequence.length - 1) {
+      nextStatus = sequence[currentIndex + 1];
+    }
+
+    const movedLocation = this.interpolateLocation(booking.currentLocation, booking.drop, 0.22);
+
+    return {
+      ...booking,
+      status: nextStatus,
+      currentLocation: movedLocation,
+      updatedAt: new Date().toISOString(),
+      notification:
+        nextStatus === 'delivered'
+          ? 'Package delivered near drop point. Completing trip now.'
+          : nextStatus === 'completed'
+            ? 'Ride completed successfully. Thank you for riding with us.'
+            : booking.notification
+    };
+  }
+
+  private interpolateLocation(start: Booking['currentLocation'], end: Booking['drop'], factor: number) {
+    const landmarkSeed = Math.abs(Math.round((start.lat + start.lng) * 1000)) % 5;
+    const landmarks = ['Maha Laxmi Garden', 'City Metro Gate', 'Lake View Point', 'Market Junction', 'Tech Park Block'];
+    const houseNumber = Math.abs(Math.round((start.lat * 10000 + start.lng * 10000) % 9000)) + 1000;
+
+    return {
+      lat: this.round(start.lat + (end.lat - start.lat) * factor),
+      lng: this.round(start.lng + (end.lng - start.lng) * factor),
+      address: `Near ${houseNumber} ${landmarks[landmarkSeed]}`
+    };
+  }
+
+  private round(value: number): number {
+    return Math.round(value * 100000) / 100000;
+  }
+
+  private persist(bookings: Booking[], notify: boolean = true): void {
+    this.bookingsSubject.next(bookings);
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(bookings));
+    // Notify other tabs (captain tab) instantly via BroadcastChannel
+    this.broadcastChannel?.postMessage({ type: 'BOOKINGS_UPDATED' });
+
+    if (notify) {
+      return;
+    }
+  }
+
+  private loadBookings(): Booking[] {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) {
+      return [];
+    }
+
+    try {
+      return JSON.parse(raw) as Booking[];
+    } catch {
+      localStorage.removeItem(STORAGE_KEY);
+      return [];
+    }
   }
 }
-
-start();
