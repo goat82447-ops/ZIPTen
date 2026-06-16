@@ -32,6 +32,8 @@ const gmailFromEmail = process.env.GMAIL_FROM_EMAIL || gmailUser;
 const twilioAccountSid = process.env.TWILIO_ACCOUNT_SID || '';
 const twilioAuthToken = process.env.TWILIO_AUTH_TOKEN || '';
 const twilioFromNumber = process.env.TWILIO_FROM_NUMBER || '';
+const githubToken = process.env.GITHUB_TOKEN || '';
+const githubIssuesRepo = process.env.GITHUB_ISSUES_REPO || 'goat82447-ops/enterprise-lunchbox-lms-prod';
 
 let twilioClient = null;
 let gmailTransporter = null;
@@ -116,6 +118,56 @@ function nowIso() { return new Date().toISOString(); }
 function genOtp() { return `${Math.floor(100000 + Math.random() * 900000)}`; }
 function toBool(v) { return Number(v || 0) === 1; }
 function safeJson(text, fallback) { try { return JSON.parse(text); } catch { return fallback; } }
+
+async function createGithubIssueForBugReport({ type, subject, name, contact, description, requestMeta }) {
+  if (String(type || '').toLowerCase() !== 'bug') {
+    return null;
+  }
+
+  if (!githubToken) {
+    throw new Error('GITHUB_TOKEN is not configured on backend.');
+  }
+
+  const lines = [
+    '## Bug Details',
+    String(description || '').trim(),
+    '',
+    '## Reporter',
+    `- Name: ${name ? String(name).trim() : 'Not provided'}`,
+    `- Contact: ${contact ? String(contact).trim() : 'Not provided'}`,
+    '',
+    '## Source',
+    '- Raised from app: Contact > Complaint / Bug Report',
+    `- Raised at: ${nowIso()}`,
+    `- Client IP: ${requestMeta.ip || 'unknown'}`,
+    `- User Agent: ${requestMeta.userAgent || 'unknown'}`
+  ];
+
+  const response = await fetch(`https://api.github.com/repos/${githubIssuesRepo}/issues`, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${githubToken}`,
+      'Accept': 'application/vnd.github+json',
+      'Content-Type': 'application/json',
+      'X-GitHub-Api-Version': '2022-11-28'
+    },
+    body: JSON.stringify({
+      title: `[Bug] ${String(subject || '').trim()}`,
+      body: lines.join('\n'),
+      labels: ['bug']
+    })
+  });
+
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(payload?.message || `GitHub issue creation failed with status ${response.status}`);
+  }
+
+  return {
+    issueNumber: payload.number,
+    issueUrl: payload.html_url
+  };
+}
 
 function mapBookingRow(row) {
   return {
@@ -449,7 +501,7 @@ app.post('/api/auth/voice-verify', requireSession, async (_req, res) => {
 
 // ── BOOKINGS ─────────────────────────────────────────────────────────────────
 
-// SSE client registry: clientId → { res, role }
+// SSE client registry: clientId → { res, role, userId }
 const sseClients = new Map();
 
 function notifyCaptains(eventName, data) {
@@ -458,6 +510,17 @@ function notifyCaptains(eventName, data) {
     if (client.role === 'captain') {
       try { client.res.write(payload); } catch { sseClients.delete(id); }
     }
+  }
+}
+
+function notifyRideAudience(eventName, data, customerUserId) {
+  const payload = `event: ${eventName}\ndata: ${JSON.stringify(data)}\n\n`;
+  const customerId = String(customerUserId || '').trim();
+  for (const [id, client] of sseClients) {
+    const isCaptain = client.role === 'captain';
+    const isBookingCustomer = customerId.length > 0 && String(client.userId || '') === customerId;
+    if (!isCaptain && !isBookingCustomer) continue;
+    try { client.res.write(payload); } catch { sseClients.delete(id); }
   }
 }
 
@@ -555,8 +618,9 @@ app.post('/api/bookings', requireSession, async (req, res) => {
       created_at: now, updated_at: now
     });
     const created = await Booking.findById(bookingId).lean();
-    notifyCaptains('new_booking', mapBookingRow(created));
-    return res.status(201).json(mapBookingRow(created));
+    const mapped = mapBookingRow(created);
+    notifyRideAudience('new_booking', mapped, created?.user_id);
+    return res.status(201).json(mapped);
   } catch (err) { console.error('POST /api/bookings error', err); return res.status(500).json({ error: 'Failed to create booking.' }); }
 });
 
@@ -662,10 +726,31 @@ app.post('/api/promos/validate', (req, res) => {
 });
 
 app.post('/api/support/complaints', async (req, res) => {
-  const { type, subject, description } = req.body || {};
+  const { type, subject, name, contact, description } = req.body || {};
   if (!type || !subject || !description) return res.status(400).json({ error: 'type, subject, description required.' });
-  console.log(`[Support] type=${type} subject=${subject}`);
-  return res.status(201).json({ message: 'Complaint submitted successfully.' });
+
+  const requestMeta = {
+    ip: req.headers['x-forwarded-for'] || req.socket?.remoteAddress || '',
+    userAgent: req.headers['user-agent'] || ''
+  };
+
+  try {
+    const githubIssue = await createGithubIssueForBugReport({ type, subject, name, contact, description, requestMeta });
+    console.log(`[Support] type=${type} subject=${subject}${githubIssue ? ` issue=#${githubIssue.issueNumber}` : ''}`);
+
+    if (githubIssue) {
+      return res.status(201).json({
+        message: 'Bug submitted and GitHub issue created successfully.',
+        issueNumber: githubIssue.issueNumber,
+        issueUrl: githubIssue.issueUrl
+      });
+    }
+
+    return res.status(201).json({ message: 'Complaint submitted successfully.' });
+  } catch (error) {
+    console.error('Support complaint error', error);
+    return res.status(502).json({ error: `Failed to raise bug in GitHub: ${error.message}` });
+  }
 });
 
 app.post('/api/support/app-feedback', async (req, res) => {
