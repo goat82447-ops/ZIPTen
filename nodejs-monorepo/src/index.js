@@ -1,5 +1,6 @@
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const dotenv = require('dotenv');
 const express = require('express');
 const cors = require('cors');
@@ -34,6 +35,9 @@ const twilioAuthToken = process.env.TWILIO_AUTH_TOKEN || '';
 const twilioFromNumber = process.env.TWILIO_FROM_NUMBER || '';
 const githubToken = process.env.GITHUB_TOKEN || '';
 const githubIssuesRepo = process.env.GITHUB_ISSUES_REPO || 'goat82447-ops/enterprise-lunchbox-lms-prod';
+const githubWebhookSecret = process.env.GITHUB_WEBHOOK_SECRET || '';
+const openAiApiKey = process.env.OPENAI_API_KEY || '';
+const openAiModel = process.env.OPENAI_MODEL || 'gpt-4o-mini';
 
 let twilioClient = null;
 let gmailTransporter = null;
@@ -118,6 +122,173 @@ function nowIso() { return new Date().toISOString(); }
 function genOtp() { return `${Math.floor(100000 + Math.random() * 900000)}`; }
 function toBool(v) { return Number(v || 0) === 1; }
 function safeJson(text, fallback) { try { return JSON.parse(text); } catch { return fallback; } }
+
+function secureCompare(a, b) {
+  if (!a || !b) return false;
+  const ab = Buffer.from(String(a));
+  const bb = Buffer.from(String(b));
+  if (ab.length !== bb.length) return false;
+  return crypto.timingSafeEqual(ab, bb);
+}
+
+function verifyGithubWebhook(req) {
+  if (!githubWebhookSecret) return true;
+  const signature = req.headers['x-hub-signature-256'];
+  if (!signature || !req.rawBody) return false;
+  const digest = `sha256=${crypto.createHmac('sha256', githubWebhookSecret).update(req.rawBody).digest('hex')}`;
+  return secureCompare(signature, digest);
+}
+
+function heuristicRcaAnalysis(issue) {
+  const title = String(issue?.title || '').toLowerCase();
+  const body = String(issue?.body || '').toLowerCase();
+  const text = `${title}\n${body}`;
+
+  const signals = [];
+  if (text.includes('cannot') || text.includes('can not') || text.includes('not working')) signals.push('feature-regression');
+  if (text.includes('login') || text.includes('auth') || text.includes('otp') || text.includes('token')) signals.push('auth-flow');
+  if (text.includes('500') || text.includes('internal server error')) signals.push('backend-exception');
+  if (text.includes('cors') || text.includes('network') || text.includes('fetch failed')) signals.push('network-cors');
+  if (text.includes('save') || text.includes('localstorage') || text.includes('refresh')) signals.push('state-persistence');
+  if (text.includes('map') || text.includes('location') || text.includes('gps')) signals.push('geo-permission');
+
+  const likelyArea = signals.includes('backend-exception')
+    ? 'Backend API / server-side handling'
+    : signals.includes('network-cors')
+      ? 'Network, CORS, or API base URL configuration'
+      : signals.includes('auth-flow')
+        ? 'Authentication/authorization flow'
+        : signals.includes('state-persistence')
+          ? 'Frontend state persistence and local storage lifecycle'
+          : signals.includes('geo-permission')
+            ? 'Geolocation permissions or map integration'
+            : 'Frontend flow and API contract mismatch';
+
+  const primaryHypothesis = signals.includes('feature-regression')
+    ? 'Recent UI or service-layer logic change likely caused a behavior regression in this path.'
+    : signals.includes('backend-exception')
+      ? 'Request reaches backend, but server-side validation or runtime path throws before response mapping.'
+      : 'Issue likely caused by mismatch between UI assumptions and runtime data conditions.';
+
+  return {
+    likelyArea,
+    primaryHypothesis,
+    signals
+  };
+}
+
+async function aiRcaAnalysis(issue) {
+  if (!openAiApiKey) {
+    return null;
+  }
+
+  const prompt = [
+    'You are a senior debugging assistant for a delivery app.',
+    'Analyze this GitHub bug issue and provide a concise root-cause analysis comment.',
+    'Return plain markdown with sections:',
+    '1) Likely Root Cause',
+    '2) Evidence from Issue',
+    '3) Reproduction Plan',
+    '4) Fix Recommendation',
+    '5) Confidence (Low/Medium/High)',
+    '',
+    `Issue title: ${issue?.title || ''}`,
+    `Issue body:\n${issue?.body || ''}`
+  ].join('\n');
+
+  const response = await fetch('https://api.openai.com/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${openAiApiKey}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      model: openAiModel,
+      temperature: 0.2,
+      messages: [
+        { role: 'system', content: 'You produce practical production bug RCA comments for GitHub issues.' },
+        { role: 'user', content: prompt }
+      ]
+    })
+  });
+
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(payload?.error?.message || `OpenAI request failed with status ${response.status}`);
+  }
+
+  return payload?.choices?.[0]?.message?.content || null;
+}
+
+async function postGithubIssueComment(repoFullName, issueNumber, body) {
+  if (!githubToken) {
+    throw new Error('GITHUB_TOKEN is not configured on backend.');
+  }
+
+  const response = await fetch(`https://api.github.com/repos/${repoFullName}/issues/${issueNumber}/comments`, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${githubToken}`,
+      'Accept': 'application/vnd.github+json',
+      'Content-Type': 'application/json',
+      'X-GitHub-Api-Version': '2022-11-28'
+    },
+    body: JSON.stringify({ body })
+  });
+
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(payload?.message || `GitHub comment creation failed with status ${response.status}`);
+  }
+
+  return payload;
+}
+
+async function generateRcaComment(issue) {
+  const heuristic = heuristicRcaAnalysis(issue);
+
+  let aiComment = null;
+  try {
+    aiComment = await aiRcaAnalysis(issue);
+  } catch (err) {
+    console.warn('[Bug-RCA-Agent] AI analysis failed, using heuristic fallback:', err.message);
+  }
+
+  if (aiComment) {
+    return [
+      '### Automated Root Cause Analysis',
+      '',
+      aiComment,
+      '',
+      '_Generated by Bug-RCA-Agent._'
+    ].join('\n');
+  }
+
+  const signalText = heuristic.signals.length ? heuristic.signals.join(', ') : 'no strong keyword signals';
+  return [
+    '### Automated Root Cause Analysis',
+    '',
+    `**Likely Root Cause:** ${heuristic.primaryHypothesis}`,
+    '',
+    `**Likely Area:** ${heuristic.likelyArea}`,
+    '',
+    `**Issue Signals:** ${signalText}`,
+    '',
+    '**Reproduction Plan:**',
+    '1. Reproduce using exact steps from the issue body in dev/staging.',
+    '2. Capture browser console + network trace for failing request.',
+    '3. Correlate with backend logs by timestamp and route.',
+    '',
+    '**Fix Recommendation:**',
+    '1. Add guard rails for missing/invalid inputs in affected path.',
+    '2. Add regression test covering reported scenario.',
+    '3. Verify with both fresh state and persisted state (reload/re-login).',
+    '',
+    '**Confidence:** Medium',
+    '',
+    '_Generated by Bug-RCA-Agent (heuristic mode)._'
+  ].join('\n');
+}
 
 async function createGithubIssueForBugReport({ type, subject, name, contact, description, requestMeta }) {
   if (String(type || '').toLowerCase() !== 'bug') {
@@ -332,7 +503,12 @@ app.use(cors({
 }));
 app.options('*', cors());
 app.use(morgan('dev'));
-app.use(express.json({ limit: '25mb' }));
+app.use(express.json({
+  limit: '25mb',
+  verify: (req, _res, buf) => {
+    req.rawBody = buf;
+  }
+}));
 app.use(express.urlencoded({ extended: true, limit: '25mb' }));
 
 // ============================================================================
@@ -756,6 +932,47 @@ app.post('/api/support/complaints', async (req, res) => {
 app.post('/api/support/app-feedback', async (req, res) => {
   console.log('[AppFeedback]', req.body);
   return res.status(201).json({ message: 'App feedback submitted successfully.' });
+});
+
+app.post('/api/github/webhook', async (req, res) => {
+  try {
+    if (!verifyGithubWebhook(req)) {
+      return res.status(401).json({ error: 'Invalid webhook signature.' });
+    }
+
+    const event = String(req.headers['x-github-event'] || '');
+    if (event !== 'issues') {
+      return res.status(200).json({ message: 'Ignored: unsupported event type.' });
+    }
+
+    const action = String(req.body?.action || '');
+    const issue = req.body?.issue;
+    const repository = req.body?.repository;
+    if (!issue || !repository) {
+      return res.status(200).json({ message: 'Ignored: missing issue or repository payload.' });
+    }
+
+    // Ignore pull requests surfaced in issues events.
+    if (issue.pull_request) {
+      return res.status(200).json({ message: 'Ignored: pull request issue payload.' });
+    }
+
+    const labels = Array.isArray(issue.labels) ? issue.labels.map((l) => String(l?.name || '').toLowerCase()) : [];
+    const isBug = labels.includes('bug') || String(issue.title || '').toLowerCase().includes('bug');
+    const shouldAnalyze = ['opened', 'reopened'].includes(action) && isBug;
+
+    if (!shouldAnalyze) {
+      return res.status(200).json({ message: 'Ignored: not an actionable bug issue event.' });
+    }
+
+    const comment = await generateRcaComment(issue);
+    await postGithubIssueComment(repository.full_name, issue.number, comment);
+    console.log(`[Bug-RCA-Agent] Commented on ${repository.full_name}#${issue.number}`);
+    return res.status(200).json({ message: 'RCA comment posted.' });
+  } catch (error) {
+    console.error('[Bug-RCA-Agent] webhook processing failed', error);
+    return res.status(500).json({ error: `Webhook processing failed: ${error.message}` });
+  }
 });
 
 // Error handler
